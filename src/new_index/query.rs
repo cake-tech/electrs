@@ -102,7 +102,7 @@ impl Query {
         confirmed_txids.chain(mempool_txids).collect()
     }
 
-    pub fn tweaks(&self, height: usize) -> Vec<TweakData> {
+    pub fn tweaks(&self, height: usize) -> Vec<(Txid, TweakData)> {
         self.chain.tweaks(height)
     }
 

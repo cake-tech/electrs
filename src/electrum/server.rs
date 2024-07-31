@@ -293,7 +293,7 @@ impl Connection {
     pub fn tweaks_subscribe(&mut self, params: &[Value]) -> Result<Value> {
         let height = usize_from_value(params.get(0), "height")?;
         let count = usize_from_value(params.get(1), "count")?;
-        let historical = bool_from_value_or(params.get(2), "historical", false);
+        // let historical = bool_from_value_or(params.get(2), "historical", false);
 
         let current_height = self.query.chain().best_header().height();
         let sp_begin_height = self.query.config().sp_begin_height;
@@ -305,12 +305,6 @@ impl Connection {
         } else {
             height
         };
-        let hash = self
-            .query
-            .chain()
-            .header_by_height(scan_height)
-            .map(|entry| entry.hash().clone())
-            .chain_err(|| "missing header")?;
 
         let heights = scan_height + count;
         let final_height = if last_height < heights {
@@ -324,7 +318,7 @@ impl Connection {
 
             let blockheight_tweaked = self.query.blockheight_tweaked(h);
             if !blockheight_tweaked {
-                self.send_values(&[empty])?;
+                self.send_values(&[empty.clone()])?;
                 continue;
             }
 
@@ -332,26 +326,34 @@ impl Connection {
 
             if tweaks.is_empty() {
                 if h >= current_height {
-                    self.send_values(&[empty])?;
+                    self.send_values(&[empty.clone()])?;
                 }
 
                 continue;
             }
 
             let mut tweak_map = HashMap::new();
-            for tweak in tweaks.iter() {
+            for (txid, tweak) in tweaks.iter() {
                 let mut vout_map = HashMap::new();
 
                 for vout in tweak.vout_data.clone().into_iter() {
-                    let items = json!([vout.script_pubkey, vout.amount]);
+                    let items = json!([
+                        vout.script_pubkey.to_string().replace("5120", ""),
+                        vout.amount
+                    ]);
                     vout_map.insert(vout.vout, items);
                 }
 
-                tweak_map.insert(tweak.txid.to_string(), vout_map);
+                tweak_map.insert(
+                    txid.to_string(),
+                    json!({
+                        "tweak": tweak.tweak,
+                        "output_pubkeys": vout_map,
+                    }),
+                );
             }
 
-            let result = json!({"jsonrpc":"2.0","method":"blockchain.tweaks.subscribe","params":[{ h.to_string(): tweak_map }]});
-            self.send_values(&[result])?;
+            self.send_values(&[json!({"jsonrpc":"2.0","method":"blockchain.tweaks.subscribe","params":[{ h.to_string(): tweak_map }]})]);
         }
 
         self.send_values(&[

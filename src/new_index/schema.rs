@@ -5,6 +5,7 @@ use bitcoin::{hashes::sha256d::Hash as Sha256dHash, Amount};
 use bitcoin::{VarInt, Witness};
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
+use electrum_client::bitcoin::hashes::hex::ToHex;
 use hex::FromHex;
 use itertools::Itertools;
 use rayon::prelude::*;
@@ -251,25 +252,45 @@ impl Indexer {
             .collect()
     }
 
-    fn headers_to_index(&self, new_headers: &[HeaderEntry]) -> Vec<HeaderEntry> {
+    fn headers_to_index(
+        &self,
+        new_headers: &[HeaderEntry],
+        all_headers: &[HeaderEntry],
+    ) -> Vec<HeaderEntry> {
         let indexed_blockhashes = self.store.indexed_blockhashes.read().unwrap();
-        new_headers
+        let headers = if indexed_blockhashes.len() == 0 {
+            all_headers
+        } else {
+            new_headers
+        };
+
+        headers
             .iter()
             .filter(|e| !indexed_blockhashes.contains(e.hash()))
             .cloned()
             .collect()
     }
 
-    fn headers_to_tweak(&self, headers: &[HeaderEntry]) -> Vec<HeaderEntry> {
+    fn headers_to_tweak(
+        &self,
+        new_headers: &[HeaderEntry],
+        all_headers: &[HeaderEntry],
+    ) -> Vec<HeaderEntry> {
+        let tweaked_blockhashes = self.store.tweaked_blockhashes.read().unwrap();
+        let count_to_tweak =
+            all_headers.len() - self.iconfig.sp_begin_height.unwrap_or(MIN_SP_TWEAK_HEIGHT);
+        let count_not_new_to_tweak = count_to_tweak - new_headers.len();
+
+        let headers = if tweaked_blockhashes.len() < count_not_new_to_tweak {
+            all_headers
+        } else {
+            new_headers
+        };
+
         headers
             .iter()
             .filter(|e| {
-                !self
-                    .store
-                    .tweaked_blockhashes
-                    .read()
-                    .unwrap()
-                    .contains(e.hash())
+                !tweaked_blockhashes.contains(e.hash())
                     && e.height() >= self.iconfig.sp_begin_height.unwrap_or(MIN_SP_TWEAK_HEIGHT)
             })
             .cloned()
@@ -310,16 +331,6 @@ impl Indexer {
         let new_headers = self.get_new_headers(&daemon, &tip)?;
         let all_headers = self.get_all_headers()?;
 
-        let to_tweak = self.headers_to_tweak(&all_headers);
-        debug!(
-            "indexing sp tweaks from {} blocks using {:?}",
-            to_tweak.len(),
-            self.from
-        );
-        start_fetcher(self.from, &daemon, to_tweak)?
-            .map(|blocks| self.index_sp_tweaks(&blocks, &daemon));
-        self.start_auto_compactions(&self.store.tweak_db);
-
         let to_add = self.headers_to_add(&new_headers);
         debug!(
             "adding transactions from {} blocks using {:?}",
@@ -329,7 +340,7 @@ impl Indexer {
         start_fetcher(self.from, &daemon, to_add)?.map(|blocks| self.add(&blocks));
         self.start_auto_compactions(&self.store.txstore_db);
 
-        let to_index = self.headers_to_index(&new_headers);
+        let to_index = self.headers_to_index(&new_headers, &all_headers);
         debug!(
             "indexing history from {} blocks using {:?}",
             to_index.len(),
@@ -338,11 +349,20 @@ impl Indexer {
         start_fetcher(self.from, &daemon, to_index)?.map(|blocks| self.index(&blocks));
         self.start_auto_compactions(&self.store.history_db);
 
+        let to_tweak = self.headers_to_tweak(&new_headers, &all_headers);
+        debug!(
+            "indexing sp tweaks from {} blocks using {:?}",
+            to_tweak.len(),
+            self.from
+        );
+        start_fetcher(self.from, &daemon, to_tweak)?
+            .map(|blocks| self.index_sp_tweaks(&blocks, &daemon));
+        self.start_auto_compactions(&self.store.tweak_db);
+
         if let DBFlush::Disable = self.flush {
             debug!("flushing to disk");
             self.store.txstore_db.flush();
             self.store.history_db.flush();
-            self.store.tweak_db.flush();
             self.flush = DBFlush::Enable;
         }
 
@@ -406,10 +426,6 @@ impl Indexer {
         let _: Vec<_> = blocks
             .par_iter() // serialization is CPU-intensive
             .map(|b| {
-                if b.entry.height() % 1_000 == 0 {
-                    info!("Sp tweak indexing is up to height={}", b.entry.height());
-                }
-
                 let mut rows = vec![];
                 let mut tweaks: Vec<Vec<u8>> = vec![];
                 let blockhash = full_hash(&b.entry.hash()[..]);
@@ -418,12 +434,15 @@ impl Indexer {
                     tweak_transaction(blockhash, tx, &mut rows, &mut tweaks, daemon, &self.iconfig);
                 }
 
-                // persist tweak index:
-                //      K{blockhash} → {tweak1}...{tweakN}
+                // persist block tweaks index:
+                //      W{blockhash} → {tweak1}...{tweakN}
                 rows.push(BlockRow::new_tweaks(blockhash, &tweaks).into_row());
                 rows.push(BlockRow::new_done(blockhash).into_row());
 
                 self.store.tweak_db.write(rows, self.flush);
+                self.store.tweak_db.flush();
+
+                info!("Sp tweaked height={}", b.entry.height());
 
                 Some(())
             })
@@ -619,32 +638,42 @@ impl ChainQuery {
             .collect()
     }
 
-    pub fn tweaks(&self, height: usize) -> Vec<TweakData> {
+    pub fn tweaks(&self, height: usize) -> Vec<(Txid, TweakData)> {
         self._tweaks(b'K', height)
     }
 
-    fn _tweaks(&self, code: u8, height: usize) -> Vec<TweakData> {
+    fn _tweaks(&self, code: u8, height: usize) -> Vec<(Txid, TweakData)> {
         let _timer = self.start_timer("tweaks");
+        let start_hash = full_hash(&self.hash_by_height(height).unwrap()[..]);
+        let iterated = if let Some(end_hash) = self.hash_by_height(height + 1) {
+            self.store.tweak_db.iter_scan_range(
+                &[code],
+                &TweakTxRow::prefix_blockhash(code, start_hash),
+                &TweakTxRow::prefix_blockhash(code, full_hash(&end_hash[..])),
+            )
+        } else {
+            self.store
+                .tweak_db
+                .iter_scan_from(&[code], &TweakTxRow::prefix_blockhash(code, start_hash))
+        };
 
-        self.tweaks_iter_scan(code, height)
-            .map(|row| {
-                let result = TweakTxRow::from_row(row).get_tweak_data();
-                result
+        iterated
+            .filter_map(|row| {
+                let tweak_row = TweakTxRow::from_row(row);
+                if start_hash != tweak_row.key.blockhash {
+                    return None;
+                }
+
+                let txid = tweak_row.key.txid;
+                let tweak = tweak_row.get_tweak_data();
+                Some((txid, tweak))
             })
             .collect()
     }
 
     pub fn blockheight_tweaked(&self, height: usize) -> bool {
-        let blockhashes: Vec<BlockHash> = self
-            .store
-            .tweaked_blockhashes
-            .read()
-            .unwrap()
-            .iter()
-            .cloned()
-            .collect();
-
-        blockhashes.contains(&self.hash_by_height(height).unwrap())
+        let tweaked_blockhashes = load_blockhashes(&self.store.tweak_db, &BlockRow::done_filter());
+        tweaked_blockhashes.contains(&self.hash_by_height(height).unwrap())
     }
 
     // TODO: avoid duplication with stats/stats_delta?
@@ -890,6 +919,17 @@ impl ChainQuery {
             .unwrap()
             .header_by_height(height)
             .cloned()
+    }
+
+    pub fn get_block_tweaks(&self, hash: &BlockHash) -> Option<Vec<Vec<u8>>> {
+        let _timer = self.start_timer("get_block_tweaks");
+
+        self.store
+            .tweak_db
+            .get(&BlockRow::tweaks_key(full_hash(&hash[..])))
+            .map(|val| {
+                bincode_util::deserialize_little(&val).expect("failed to parse block tweaks")
+            })
     }
 
     pub fn hash_by_height(&self, height: usize) -> Option<BlockHash> {
@@ -1218,7 +1258,6 @@ pub struct VoutData {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct TweakData {
-    pub txid: Txid,
     pub tweak: String,
     pub vout_data: Vec<VoutData>,
 }
@@ -1236,19 +1275,15 @@ struct TweakTxRow {
 }
 
 impl TweakTxRow {
-    fn new(hash: FullHash, tweak: &TweakData) -> TweakTxRow {
+    fn new(blockhash: FullHash, txid: Txid, tweak: &TweakData) -> TweakTxRow {
         TweakTxRow {
             key: TweakTxKey {
                 code: b'K',
-                blockhash: hash,
-                txid: tweak.clone().txid,
+                blockhash,
+                txid,
             },
             value: tweak.clone(),
         }
-    }
-
-    fn key(prefix: &[u8]) -> Bytes {
-        [b"K", prefix].concat()
     }
 
     fn into_row(self) -> DBRow {
@@ -1267,10 +1302,6 @@ impl TweakTxRow {
 
     fn filter(code: u8) -> Bytes {
         [code].to_vec()
-    }
-
-    fn prefix_end(code: u8) -> Bytes {
-        bincode::serialize_big(&(code, std::u32::MAX)).unwrap()
     }
 
     fn prefix_blockhash(code: u8, hash: FullHash) -> Bytes {
@@ -1343,7 +1374,7 @@ fn tweak_transaction(
                             pubkeys.push(pubkey)
                         }
                         Ok(None) => (),
-                        Err(e) => {}
+                        Err(_e) => {}
                     }
                 }
             }
@@ -1353,13 +1384,14 @@ fn tweak_transaction(
     let pubkeys_ref: Vec<_> = pubkeys.iter().collect();
     if !pubkeys_ref.is_empty() {
         if let Some(tweak) = calculate_tweak_data(&pubkeys_ref, &outpoints).ok() {
-            info!("Tweak: {}", serialize_hex(&tweak.serialize()));
+            // persist tweak index:
+            //      K{blockhash}{txid} → {tweak}{serialized-vout-data}
             rows.push(
                 TweakTxRow::new(
                     blockhash,
+                    txid.clone(),
                     &TweakData {
-                        txid: txid.clone(),
-                        tweak: serialize_hex(&tweak.serialize()),
+                        tweak: tweak.serialize().to_hex(),
                         vout_data: output_pubkeys.clone(),
                     },
                 )

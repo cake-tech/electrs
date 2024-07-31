@@ -142,6 +142,22 @@ impl DB {
         }
     }
 
+    pub fn iter_scan_range(&self, prefix: &[u8], start_at: &[u8], end_at: &[u8]) -> ScanIterator {
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.fill_cache(false);
+        opts.set_iterate_upper_bound(end_at);
+
+        let iter = self.db.iterator_opt(
+            rocksdb::IteratorMode::From(start_at, rocksdb::Direction::Forward),
+            opts,
+        );
+        ScanIterator {
+            prefix: prefix.to_vec(),
+            iter,
+            done: false,
+        }
+    }
+
     pub fn iter_scan_reverse(&self, prefix: &[u8], prefix_max: &[u8]) -> ReverseScanIterator {
         let mut iter = self.db.raw_iterator();
         iter.seek_for_prev(prefix_max);
