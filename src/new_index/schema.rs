@@ -1,19 +1,15 @@
-use bitcoin::consensus::encode::serialize_hex;
 #[cfg(not(feature = "liquid"))]
 use bitcoin::merkle_tree::MerkleBlock;
 use bitcoin::{hashes::sha256d::Hash as Sha256dHash, Amount};
 use bitcoin::{VarInt, Witness};
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
-use electrum_client::bitcoin::hashes::hex::ToHex;
-use hex::FromHex;
+use hex::{DisplayHex, FromHex};
 use itertools::Itertools;
 use rayon::prelude::*;
-use std::io;
 
 #[cfg(not(feature = "liquid"))]
 use bitcoin::consensus::encode::{deserialize, serialize};
-use bitcoin::consensus::Encodable;
 #[cfg(feature = "liquid")]
 use elements::{
     confidential,
@@ -927,9 +923,7 @@ impl ChainQuery {
         self.store
             .tweak_db
             .get(&BlockRow::tweaks_key(full_hash(&hash[..])))
-            .map(|val| {
-                bincode_util::deserialize_little(&val).expect("failed to parse block tweaks")
-            })
+            .map(|val| bincode::deserialize_little(&val).expect("failed to parse block tweaks"))
     }
 
     pub fn hash_by_height(&self, height: usize) -> Option<BlockHash> {
@@ -1391,7 +1385,7 @@ fn tweak_transaction(
                     blockhash,
                     txid.clone(),
                     &TweakData {
-                        tweak: tweak.serialize().to_hex(),
+                        tweak: tweak.serialize().to_lower_hex_string(),
                         vout_data: output_pubkeys.clone(),
                     },
                 )
