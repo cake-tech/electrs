@@ -185,7 +185,12 @@ impl Index {
         sp_skip_height: Option<usize>,
     ) -> Result<bool> {
         let mut start = 0;
-        let initial_height = sp_begin_height.unwrap_or(70_000);
+        // Taproot activates around 709,000 and Silent Payments start appearing > 800,000
+        // These numbers are specific to mainnet, for regtest/testnet/signet, sp_begin_height
+        // should be specified
+        //
+        // TODO: make 800_000 a constant whose value network specific
+        let initial_height = sp_begin_height.unwrap_or(800_000);
 
         if let Some(sp_skip_height) = sp_skip_height {
             start = sp_skip_height;
@@ -223,10 +228,6 @@ impl Index {
             } else {
                 start = initial_height;
             }
-        }
-
-        if start == initial_height {
-            panic!("start height is the same as initial height");
         }
 
         let new_header = self
@@ -282,6 +283,7 @@ impl Index {
 
                     for tweak_data in tweak_block_data.tx_data {
                         let mut tx_response_map = serde_json::Map::new();
+                        let mut send_tweak_data = false;
 
                         tx_response_map.insert(
                             "tweak".to_string(),
@@ -298,6 +300,44 @@ impl Index {
                                     let mut is_unspent = false;
 
                                     if !historical {
+                                        // TODO: probably a faster way to do this, considering
+                                        // every client call is going to be doing the same utxo
+                                        // lookups over and over again, which is likely putting the
+                                        // server under too much load.
+                                        //
+                                        // since utxos only update every ~10 mins on average, seems
+                                        // better to update spent vs unspent directly in the
+                                        // database after a new block arrives. One idea would be to
+                                        // have three indexes: U, B, and T where U is a taproot
+                                        // unspent outputs cache (key: 32 byte key), B is record of
+                                        // the last time a specific block of tweaks was read (key:
+                                        // block_number), and T is the tweak index (key: block_num,
+                                        // value: TweakBlockData). The flow would be:
+                                        //
+                                        //     1. client makes a request for block X
+                                        //     2. check if X in B
+                                        //        2a. if yes, continue to step 3
+                                        //        2b. if no, filter tweaks by checking the taproot
+                                        //            outputs against U (this should be much faster
+                                        //            than an rpc call to bitcoind). After
+                                        //            filtering, write newly filtered tweaks back
+                                        //            to T, and add an entry in B
+                                        //     3. send tweak data to client
+                                        //     4. every time a new block comes in, wipe B
+                                        //
+                                        // This way, tweak data is not filtered over and over again
+                                        // in the 10 minute period where the UTXO set has not
+                                        // changed. When the UTXO set does change, the first time
+                                        // the tweak data is read, it is filtered and sent to the
+                                        // client and then written back so that the next call
+                                        // doesnt need to do the filtering again
+                                        //
+                                        // Worth mentioning: this means the index has no historical
+                                        // data, but ideally it shouldn't: clients who want
+                                        // transaction history can do so with a full node or an
+                                        // offline tool. This means recovery from backup will give
+                                        // you your full wallet balance, but not your full tx
+                                        // history
                                         let unspent_response = daemon
                                             .get_tx_out(&tweak_data.txid, vout.vout)
                                             .ok()
@@ -306,6 +346,7 @@ impl Index {
                                     }
 
                                     if historical || is_unspent {
+                                        send_tweak_data = true;
                                         vout_map.insert(
                                             vout.vout.to_string(),
                                             serde_json::Value::Array(vec![
@@ -322,16 +363,20 @@ impl Index {
                             }
                         }
 
-                        block_response_map.insert(
-                            tweak_data.txid.to_string(),
-                            serde_json::Value::Object(tx_response_map),
-                        );
+                        if send_tweak_data {
+                            block_response_map.insert(
+                                tweak_data.txid.to_string(),
+                                serde_json::Value::Object(tx_response_map),
+                            );
+                        }
                     }
 
-                    map.insert(
-                        tweak_block_data.block_height.to_string(),
-                        serde_json::Value::Object(block_response_map),
-                    );
+                    if !block_response_map.is_empty() {
+                        map.insert(
+                            tweak_block_data.block_height.to_string(),
+                            serde_json::Value::Object(block_response_map),
+                        );
+                    }
 
                     Some(())
                 } else {
@@ -570,6 +615,14 @@ fn scan_single_block_for_silent_payments(
                 let prev_txid = i.previous_output.txid;
                 let prev_vout = i.previous_output.vout;
 
+                // Collect outpoints from all of the inputs, not just the silent payment eligible
+                // inputs. This is relevant for transactions that have a mix of silent payments
+                // eligible and non-eligible inputs, where the smallest outpoint is for one of the
+                // non-eligible inputs
+                outpoints
+                    .lock()
+                    .unwrap()
+                    .push((prev_txid.to_string(), prev_vout));
                 let prev_tx = self.daemon.get_transaction(&prev_txid, None).ok();
                 let prevout: Option<bitcoin::TxOut> = prev_tx.and_then(|prev_tx| {
                     let index: Option<usize> = prev_vout.try_into().ok();
@@ -582,13 +635,7 @@ fn scan_single_block_for_silent_payments(
                         &i.witness.to_vec(),
                         prevout.script_pubkey.as_bytes(),
                     ) {
-                        Ok(Some(pubkey)) => {
-                            outpoints
-                                .lock()
-                                .unwrap()
-                                .push((prev_txid.to_string(), prev_vout));
-                            pubkeys.lock().unwrap().push(pubkey)
-                        }
+                        Ok(Some(pubkey)) => pubkeys.lock().unwrap().push(pubkey),
                         Ok(None) => (),
                         Err(_) => {}
                     }
