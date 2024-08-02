@@ -338,7 +338,9 @@ impl Connection {
 
                 for vout in tweak.vout_data.clone().into_iter() {
                     let items = json!([
-                        vout.script_pubkey.to_string().replace("5120", ""),
+                        regex::Regex::new(r"^225120")
+                            .unwrap()
+                            .replace(&serialize_hex(&vout.script_pubkey), ""),
                         vout.amount
                     ]);
                     vout_map.insert(vout.vout, items);
@@ -353,7 +355,7 @@ impl Connection {
                 );
             }
 
-            self.send_values(&[json!({"jsonrpc":"2.0","method":"blockchain.tweaks.subscribe","params":[{ h.to_string(): tweak_map }]})]);
+            let _ = self.send_values(&[json!({"jsonrpc":"2.0","method":"blockchain.tweaks.subscribe","params":[{ h.to_string(): tweak_map }]})]);
         }
 
         self.send_values(&[
