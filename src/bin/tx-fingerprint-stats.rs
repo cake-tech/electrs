@@ -41,9 +41,20 @@ fn main() {
         .unwrap(),
     );
 
-    let chain = ChainQuery::new(Arc::clone(&store), Arc::clone(&daemon), &config, &metrics);
+    let chain = Arc::new(ChainQuery::new(
+        Arc::clone(&store),
+        Arc::clone(&daemon),
+        &config,
+        &metrics,
+    ));
 
-    let mut indexer = Indexer::open(Arc::clone(&store), FetchFrom::Bitcoind, &config, &metrics);
+    let mut indexer = Indexer::open(
+        Arc::clone(&store),
+        FetchFrom::Bitcoind,
+        &config,
+        &metrics,
+        &chain,
+    );
     indexer.update(&daemon).unwrap();
 
     let mut iter = store.txstore_db().raw_iterator();

@@ -23,6 +23,7 @@ use crate::util::{spawn_thread, HeaderEntry, SyncChannel};
 pub enum FetchFrom {
     Bitcoind,
     BlkFiles,
+    BlkFilesReverse,
 }
 
 pub fn start_fetcher(
@@ -32,7 +33,8 @@ pub fn start_fetcher(
 ) -> Result<Fetcher<Vec<BlockEntry>>> {
     let fetcher = match from {
         FetchFrom::Bitcoind => bitcoind_fetcher,
-        FetchFrom::BlkFiles => blkfiles_fetcher,
+        FetchFrom::BlkFiles => blkfiles_fetcher_normal,
+        FetchFrom::BlkFilesReverse => blkfiles_fetcher_reverse,
     };
     fetcher(daemon, new_headers)
 }
@@ -103,12 +105,30 @@ fn bitcoind_fetcher(
     ))
 }
 
-fn blkfiles_fetcher(
+fn blkfiles_fetcher_normal(
     daemon: &Daemon,
     new_headers: Vec<HeaderEntry>,
 ) -> Result<Fetcher<Vec<BlockEntry>>> {
+    blkfiles_fetcher(daemon, new_headers, false)
+}
+
+fn blkfiles_fetcher_reverse(
+    daemon: &Daemon,
+    new_headers: Vec<HeaderEntry>,
+) -> Result<Fetcher<Vec<BlockEntry>>> {
+    blkfiles_fetcher(daemon, new_headers, true)
+}
+
+fn blkfiles_fetcher(
+    daemon: &Daemon,
+    new_headers: Vec<HeaderEntry>,
+    reverse: bool,
+) -> Result<Fetcher<Vec<BlockEntry>>> {
     let magic = daemon.magic();
-    let blk_files = daemon.list_blk_files()?;
+    let mut blk_files = daemon.list_blk_files()?;
+    if reverse {
+        blk_files.reverse();
+    }
 
     let chan = SyncChannel::new(1);
     let sender = chan.sender();
@@ -120,25 +140,35 @@ fn blkfiles_fetcher(
     Ok(Fetcher::from(
         chan.into_receiver(),
         spawn_thread("blkfiles_fetcher", move || {
-            parser.map(|sizedblocks| {
-                let block_entries: Vec<BlockEntry> = sizedblocks
-                    .into_iter()
-                    .filter_map(|(block, size)| {
-                        let blockhash = block.block_hash();
-                        entry_map
-                            .remove(&blockhash)
-                            .map(|entry| BlockEntry { block, entry, size })
-                            .or_else(|| {
-                                trace!("skipping block {}", blockhash);
-                                None
-                            })
-                    })
-                    .collect();
+            for sizedblocks in parser.receiver {
+                let mut block_entries: Vec<BlockEntry> = vec![];
+
+                for (block, size) in &sizedblocks {
+                    let blockhash = block.block_hash();
+
+                    match entry_map.remove(&blockhash).map(|entry| BlockEntry {
+                        block: block.clone(),
+                        entry,
+                        size: size.clone(),
+                    }) {
+                        Some(entry) => block_entries.push(entry),
+                        None => {
+                            trace!("skipping block {}", blockhash);
+                            break;
+                        }
+                    };
+                }
+
+                if entry_map.is_empty() {
+                    break;
+                }
+
                 trace!("fetched {} blocks", block_entries.len());
                 sender
                     .send(block_entries)
                     .expect("failed to send blocks entries from blk*.dat files");
-            });
+            }
+
             if !entry_map.is_empty() {
                 panic!(
                     "failed to index {} blocks from blk*.dat files",
