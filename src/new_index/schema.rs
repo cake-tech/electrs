@@ -258,10 +258,7 @@ impl Indexer {
     }
 
     fn headers_to_index(&mut self, new_headers: &[HeaderEntry]) -> Vec<HeaderEntry> {
-        let indexed_blockhashes = {
-            let indexed_blockhashes = self.store.indexed_blockhashes.read().unwrap();
-            indexed_blockhashes.clone()
-        };
+        let indexed_blockhashes = self.query.indexed_blockhashes();
         self.get_headers_to_use(indexed_blockhashes.len(), new_headers, 0)
             .iter()
             .filter(|e| !indexed_blockhashes.contains(e.hash()))
@@ -270,10 +267,7 @@ impl Indexer {
     }
 
     fn headers_to_tweak(&mut self, new_headers: &[HeaderEntry]) -> Vec<HeaderEntry> {
-        let tweaked_blockhashes = {
-            let tweaked_blockhashes = self.store.tweaked_blockhashes.read().unwrap();
-            tweaked_blockhashes.clone()
-        };
+        let tweaked_blockhashes = self.query.tweaked_blockhashes();
         let start_height = self.iconfig.sp_begin_height.unwrap_or(MIN_SP_TWEAK_HEIGHT);
 
         self.get_headers_to_use(tweaked_blockhashes.len(), new_headers, start_height)
@@ -322,18 +316,22 @@ impl Indexer {
         start_height: usize,
     ) -> Vec<HeaderEntry> {
         let all_indexed_headers = self.get_all_indexed_headers().unwrap();
-        let count_left_to_index = all_indexed_headers.len() - start_height - lookup_len;
+        let count_total_indexed = all_indexed_headers.len() - start_height;
 
-        if count_left_to_index > new_headers.len() {
+        // Should have indexed more than what already has been indexed, use all headers
+        if count_total_indexed > lookup_len {
+            let count_left_to_index = lookup_len - count_total_indexed;
+
             if let FetchFrom::BlkFiles = self.from {
                 if count_left_to_index < all_indexed_headers.len() / 2 {
                     self.from = FetchFrom::BlkFilesReverse;
                 }
             }
 
-            all_indexed_headers
+            return all_indexed_headers;
         } else {
-            new_headers.to_vec()
+            // Just needs to index new headers
+            return new_headers.to_vec();
         }
     }
 
@@ -790,9 +788,17 @@ impl ChainQuery {
             .collect()
     }
 
+    pub fn indexed_blockhashes(&self) -> HashSet<BlockHash> {
+        load_blockhashes(&self.store.history_db, &BlockRow::done_filter())
+    }
+
+    pub fn tweaked_blockhashes(&self) -> HashSet<BlockHash> {
+        load_blockhashes(&self.store.tweak_db, &BlockRow::done_filter())
+    }
+
     pub fn blockheight_tweaked(&self, height: usize) -> bool {
-        let tweaked_blockhashes = load_blockhashes(&self.store.tweak_db, &BlockRow::done_filter());
-        tweaked_blockhashes.contains(&self.hash_by_height(height).unwrap())
+        self.tweaked_blockhashes()
+            .contains(&self.hash_by_height(height).unwrap())
     }
 
     // TODO: avoid duplication with stats/stats_delta?
