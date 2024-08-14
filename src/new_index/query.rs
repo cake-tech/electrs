@@ -1,6 +1,7 @@
 use rayon::prelude::*;
 
 use std::collections::{BTreeSet, HashMap};
+use std::convert::TryInto;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
@@ -17,7 +18,7 @@ use crate::{
     elements::{lookup_asset, AssetRegistry, AssetSorting, LiquidAsset},
 };
 
-use super::schema::TweakData;
+use super::schema::{TweakData, MIN_SP_TWEAK_HEIGHT};
 
 const FEE_ESTIMATES_TTL: u64 = 60; // seconds
 
@@ -67,6 +68,14 @@ impl Query {
         self.config.network_type
     }
 
+    pub fn sp_begin_height(&self) -> u32 {
+        self.config
+            .sp_begin_height
+            .unwrap_or(MIN_SP_TWEAK_HEIGHT)
+            .try_into()
+            .unwrap()
+    }
+
     pub fn mempool(&self) -> RwLockReadGuard<Mempool> {
         self.mempool.read().unwrap()
     }
@@ -102,12 +111,8 @@ impl Query {
         confirmed_txids.chain(mempool_txids).collect()
     }
 
-    pub fn tweaks(&self, height: usize) -> Vec<(Txid, TweakData)> {
+    pub fn tweaks(&self, height: u32) -> Vec<(Txid, TweakData)> {
         self.chain.tweaks(height)
-    }
-
-    pub fn blockheight_tweaked(&self, height: usize) -> bool {
-        self.chain.blockheight_tweaked(height)
     }
 
     pub fn stats(&self, scripthash: &[u8]) -> (ScriptStats, ScriptStats) {

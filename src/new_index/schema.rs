@@ -19,6 +19,7 @@ use elements::{
 use silentpayments::utils::receiving::{calculate_tweak_data, get_pubkey_from_input};
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::convert::TryInto;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -446,9 +447,16 @@ impl Indexer {
                 let mut rows = vec![];
                 let mut tweaks: Vec<Vec<u8>> = vec![];
                 let blockhash = full_hash(&b.entry.hash()[..]);
+                let blockheight = b.entry.height();
 
                 for tx in &b.block.txdata {
-                    self.tweak_transaction(blockhash, tx, &mut rows, &mut tweaks, daemon);
+                    self.tweak_transaction(
+                        blockheight.try_into().unwrap(),
+                        tx,
+                        &mut rows,
+                        &mut tweaks,
+                        daemon,
+                    );
                 }
 
                 // persist block tweaks index:
@@ -475,7 +483,7 @@ impl Indexer {
 
     fn tweak_transaction(
         &self,
-        blockhash: FullHash,
+        blockheight: u32,
         tx: &Transaction,
         rows: &mut Vec<DBRow>,
         tweaks: &mut Vec<Vec<u8>>,
@@ -562,7 +570,7 @@ impl Indexer {
                 //      K{blockhash}{txid} → {tweak}{serialized-vout-data}
                 rows.push(
                     TweakTxRow::new(
-                        blockhash,
+                        blockheight,
                         txid.clone(),
                         &TweakData {
                             tweak: tweak.serialize().to_lower_hex_string(),
@@ -684,11 +692,10 @@ impl ChainQuery {
         })
     }
 
-    pub fn tweaks_iter_scan(&self, code: u8, start_height: usize) -> ScanIterator {
-        let hash = full_hash(&self.hash_by_height(start_height).unwrap()[..]);
+    fn tweaks_iter_scan(&self, code: u8, height: u32) -> ScanIterator {
         self.store.tweak_db.iter_scan_from(
             &TweakTxRow::filter(code),
-            &TweakTxRow::prefix_blockhash(code, hash),
+            &TweakTxRow::prefix_blockheight(code, height),
         )
     }
 
@@ -764,20 +771,16 @@ impl ChainQuery {
             .collect()
     }
 
-    pub fn tweaks(&self, height: usize) -> Vec<(Txid, TweakData)> {
+    pub fn tweaks(&self, height: u32) -> Vec<(Txid, TweakData)> {
         self._tweaks(b'K', height)
     }
 
-    fn _tweaks(&self, code: u8, height: usize) -> Vec<(Txid, TweakData)> {
+    fn _tweaks(&self, code: u8, height: u32) -> Vec<(Txid, TweakData)> {
         let _timer = self.start_timer("tweaks");
-        let start_hash = full_hash(&self.hash_by_height(height).unwrap()[..]);
-
-        self.store
-            .tweak_db
-            .iter_scan_from(&[code], &TweakTxRow::prefix_blockhash(code, start_hash))
+        self.tweaks_iter_scan(code, height)
             .filter_map(|row| {
                 let tweak_row = TweakTxRow::from_row(row);
-                if start_hash != tweak_row.key.blockhash {
+                if height != tweak_row.key.blockheight {
                     return None;
                 }
 
@@ -794,11 +797,6 @@ impl ChainQuery {
 
     pub fn tweaked_blockhashes(&self) -> HashSet<BlockHash> {
         load_blockhashes(&self.store.tweak_db, &BlockRow::done_filter())
-    }
-
-    pub fn blockheight_tweaked(&self, height: usize) -> bool {
-        self.tweaked_blockhashes()
-            .contains(&self.hash_by_height(height).unwrap())
     }
 
     // TODO: avoid duplication with stats/stats_delta?
@@ -1459,7 +1457,7 @@ pub struct TweakData {
 #[derive(Serialize, Deserialize)]
 struct TweakTxKey {
     code: u8,
-    blockhash: FullHash,
+    blockheight: u32,
     txid: Txid,
 }
 
@@ -1469,11 +1467,11 @@ struct TweakTxRow {
 }
 
 impl TweakTxRow {
-    fn new(blockhash: FullHash, txid: Txid, tweak: &TweakData) -> TweakTxRow {
+    fn new(blockheight: u32, txid: Txid, tweak: &TweakData) -> TweakTxRow {
         TweakTxRow {
             key: TweakTxKey {
                 code: b'K',
-                blockhash,
+                blockheight,
                 txid,
             },
             value: tweak.clone(),
@@ -1498,8 +1496,8 @@ impl TweakTxRow {
         [code].to_vec()
     }
 
-    fn prefix_blockhash(code: u8, hash: FullHash) -> Bytes {
-        bincode::serialize_big(&(code, hash)).unwrap()
+    fn prefix_blockheight(code: u8, height: u32) -> Bytes {
+        bincode::serialize_big(&(code, height)).unwrap()
     }
 
     pub fn get_tweak_data(&self) -> TweakData {

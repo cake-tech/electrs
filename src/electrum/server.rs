@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::convert::TryInto;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
@@ -290,18 +291,23 @@ impl Connection {
         Ok(status_hash)
     }
 
+    // Progressively receive block tweak data per height iteration
+    // Client is expected to actively listen for messages until "done"
     pub fn tweaks_subscribe(&mut self, params: &[Value]) -> Result<Value> {
-        let height = usize_from_value(params.get(0), "height")?;
-        let count = usize_from_value(params.get(1), "count")?;
+        let height: u32 = usize_from_value(params.get(0), "height")?
+            .try_into()
+            .unwrap();
+        let count: u32 = usize_from_value(params.get(1), "count")?
+            .try_into()
+            .unwrap();
         // let historical = bool_from_value_or(params.get(2), "historical", false);
 
-        let current_height = self.query.chain().best_header().height();
-        let sp_begin_height = self.query.config().sp_begin_height;
+        let sp_begin_height = self.query.sp_begin_height();
         let last_header_entry = self.query.chain().best_header();
-        let last_height = last_header_entry.height();
+        let last_height = last_header_entry.height().try_into().unwrap();
 
-        let scan_height = if height < sp_begin_height.unwrap_or(0) {
-            sp_begin_height.unwrap_or(0)
+        let scan_height = if height < sp_begin_height {
+            sp_begin_height
         } else {
             height
         };
@@ -313,22 +319,12 @@ impl Connection {
             heights
         };
 
-        for h in scan_height..=final_height {
+        for h in scan_height..=final_height.try_into().unwrap() {
             let empty = json!({ "jsonrpc":"2.0","method":"blockchain.tweaks.subscribe","params":[{h.to_string(): {}}]});
 
-            let blockheight_tweaked = self.query.blockheight_tweaked(h);
-            if !blockheight_tweaked {
-                self.send_values(&[empty.clone()])?;
-                continue;
-            }
-
             let tweaks = self.query.tweaks(h);
-
             if tweaks.is_empty() {
-                if h >= current_height {
-                    self.send_values(&[empty.clone()])?;
-                }
-
+                self.send_values(&[empty.clone()])?;
                 continue;
             }
 
@@ -358,10 +354,9 @@ impl Connection {
             let _ = self.send_values(&[json!({"jsonrpc":"2.0","method":"blockchain.tweaks.subscribe","params":[{ h.to_string(): tweak_map }]})]);
         }
 
-        self.send_values(&[
-            json!({"jsonrpc":"2.0","method":"blockchain.tweaks.subscribe","params":[{"message": "done"}]}),
-        ])?;
-        Ok(json!(current_height))
+        let done = json!({"jsonrpc":"2.0","method":"blockchain.tweaks.subscribe","params":[{"message": "done"}]});
+        self.send_values(&[done.clone()])?;
+        Ok(done)
     }
 
     #[cfg(not(feature = "liquid"))]
