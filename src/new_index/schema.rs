@@ -146,7 +146,7 @@ impl From<&Utxo> for OutPoint {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpendingInput {
     pub txid: Txid,
     pub vin: u32,
@@ -498,33 +498,14 @@ impl Indexer {
                 if txo.script_pubkey.is_v1_p2tr()
                     && amount >= self.iconfig.sp_min_dust.unwrap_or(1_000) as u64
                 {
-                    // let get_txout = daemon.gettxout(txid, txo_index as u32, false).ok().unwrap();
-                    // let is_spent = get_txout.is_null();
-
-                    // let test = self.query.lookup_spend(&OutPoint {
-                    //     txid: txid.clone(),
-                    //     vout: txo_index as u32,
-                    // });
-                    // info!("{} {}: {:?}", txid, txo_index, test);
-                    // if is_spent {
-                    //     let info = daemon.gettransaction_raw(txid, None, true).ok().unwrap();
-                    //     let blockhash = info.get("blockhash").unwrap().as_str().unwrap();
-                    //     let block = daemon.getblock(blockhash).ok().unwrap();
-                    //     let height = block.get("height").unwrap().as_u64().unwrap();
-
-                    //     // rows.push(
-                    //     //     TweakSpentP2trCacheRow::new(
-                    //     //         full_hash(&txo.script_pubkey[..]),
-                    //     //         height as usize,
-                    //     //     )
-                    //     //     .into_row(),
-                    //     // );
-                    // }
-
                     output_pubkeys.push(VoutData {
                         vout: txo_index,
                         amount,
                         script_pubkey: txo.script_pubkey.clone(),
+                        spending_input: self.query.lookup_spend(&OutPoint {
+                            txid: txid.clone(),
+                            vout: txo_index as u32,
+                        }),
                     });
                 }
             }
@@ -541,6 +522,12 @@ impl Indexer {
             let prev_txid = txin.previous_output.txid;
             let prev_vout = txin.previous_output.vout;
 
+            // Collect outpoints from all of the inputs, not just the silent payment eligible
+            // inputs. This is relevant for transactions that have a mix of silent payments
+            // eligible and non-eligible inputs, where the smallest outpoint is for one of the
+            // non-eligible inputs
+            outpoints.push((prev_txid.to_string(), prev_vout));
+
             let prev_tx_result = daemon.gettransaction_raw(&prev_txid, None, true);
             if let Ok(prev_tx_value) = prev_tx_result {
                 if let Some(prev_tx) = tx_from_value(prev_tx_value.get("hex").unwrap().clone()).ok()
@@ -551,10 +538,7 @@ impl Indexer {
                             &(txin.witness.clone() as Witness).to_vec(),
                             &prevout.script_pubkey.to_bytes(),
                         ) {
-                            Ok(Some(pubkey)) => {
-                                outpoints.push((prev_txid.to_string(), prev_vout));
-                                pubkeys.push(pubkey)
-                            }
+                            Ok(Some(pubkey)) => pubkeys.push(pubkey),
                             Ok(None) => (),
                             Err(_e) => {}
                         }
@@ -692,13 +676,6 @@ impl ChainQuery {
         })
     }
 
-    fn tweaks_iter_scan(&self, code: u8, height: u32) -> ScanIterator {
-        self.store.tweak_db.iter_scan_from(
-            &TweakTxRow::filter(code),
-            &TweakTxRow::prefix_blockheight(code, height),
-        )
-    }
-
     pub fn history_iter_scan(&self, code: u8, hash: &[u8], start_height: usize) -> ScanIterator {
         self.store.history_db.iter_scan_from(
             &TxHistoryRow::filter(code, &hash[..]),
@@ -769,6 +746,28 @@ impl ChainQuery {
             .filter_map(|txid| self.tx_confirming_block(&txid).map(|b| (txid, b)))
             .take(limit)
             .collect()
+    }
+
+    pub fn store_tweak_cache_height(&self, height: u32, tip: u32) {
+        self.store.tweak_db.put_sync(
+            &TweakBlockRecordCacheRow::key(height),
+            &TweakBlockRecordCacheRow::value(tip),
+        );
+    }
+
+    pub fn get_tweak_cached_height(&self, height: u32) -> Option<u32> {
+        self.store
+            .tweak_db
+            .iter_scan(&TweakBlockRecordCacheRow::key(height))
+            .map(|v| TweakBlockRecordCacheRow::from_row(v).value)
+            .next()
+    }
+
+    fn tweaks_iter_scan(&self, code: u8, height: u32) -> ScanIterator {
+        self.store.tweak_db.iter_scan_from(
+            &TweakTxRow::filter(code),
+            &TweakTxRow::prefix_blockheight(code, height),
+        )
     }
 
     pub fn tweaks(&self, height: u32) -> Vec<(Txid, TweakData)> {
@@ -1373,101 +1372,73 @@ fn index_blocks(
 #[derive(Serialize, Deserialize)]
 struct TweakBlockRecordCacheKey {
     code: u8,
-    height: usize,
+    height: u32,
 }
 
 struct TweakBlockRecordCacheRow {
     key: TweakBlockRecordCacheKey,
+    value: u32, // last_height when the tweak cache was updated
 }
 
 impl TweakBlockRecordCacheRow {
-    fn new(height: usize) -> Self {
+    fn new(height: u32, tip: u32) -> Self {
         TweakBlockRecordCacheRow {
             key: TweakBlockRecordCacheKey { code: b'B', height },
+            value: tip,
         }
     }
 
-    pub fn key(height: usize) -> Bytes {
+    pub fn key(height: u32) -> Bytes {
         bincode::serialize_big(&TweakBlockRecordCacheKey { code: b'B', height }).unwrap()
     }
 
-    fn into_row(self) -> DBRow {
-        let TweakBlockRecordCacheRow { key } = self;
-        DBRow {
-            key: bincode::serialize_big(&key).unwrap(),
-            value: vec![],
-        }
+    pub fn value(tip: u32) -> Bytes {
+        bincode::serialize_big(&tip).unwrap()
     }
-}
 
-#[derive(Serialize, Deserialize)]
-struct TweakSpentP2trCacheKey {
-    code: u8,
-    scripthash: FullHash,
-}
-
-struct TweakSpentP2trCacheRow {
-    key: TweakSpentP2trCacheKey,
-    value: Bytes, // confirmation height
-}
-
-impl TweakSpentP2trCacheRow {
-    fn new(scripthash: FullHash, height: usize) -> TweakSpentP2trCacheRow {
-        TweakSpentP2trCacheRow {
-            key: TweakSpentP2trCacheKey {
-                code: b'K',
-                scripthash,
-            },
-            value: bincode::serialize_big(&height).unwrap(),
-        }
+    pub fn from_row(row: DBRow) -> TweakBlockRecordCacheRow {
+        let key: TweakBlockRecordCacheKey = bincode::deserialize_big(&row.key).unwrap();
+        let value: u32 = bincode::deserialize_big(&row.value).unwrap();
+        TweakBlockRecordCacheRow { key, value }
     }
 
     fn into_row(self) -> DBRow {
-        let TweakSpentP2trCacheRow { key, value } = self;
+        let TweakBlockRecordCacheRow { key, value } = self;
         DBRow {
             key: bincode::serialize_big(&key).unwrap(),
-            value,
+            value: bincode::serialize_big(&value).unwrap(),
         }
-    }
-
-    fn from_row(row: DBRow) -> TweakSpentP2trCacheRow {
-        let key: TweakSpentP2trCacheKey = bincode::deserialize_big(&row.key).unwrap();
-        let value = row.value;
-        TweakSpentP2trCacheRow { key, value }
-    }
-
-    fn filter(code: u8) -> Bytes {
-        [code].to_vec()
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VoutData {
     pub vout: usize,
     pub amount: u64,
     pub script_pubkey: Script,
+    pub spending_input: Option<SpendingInput>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TweakData {
     pub tweak: String,
     pub vout_data: Vec<VoutData>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct TweakTxKey {
+pub struct TweakTxKey {
     code: u8,
     blockheight: u32,
     txid: Txid,
 }
 
-struct TweakTxRow {
-    key: TweakTxKey,
-    value: TweakData,
+pub struct TweakTxRow {
+    pub key: TweakTxKey,
+    pub value: TweakData,
 }
 
 impl TweakTxRow {
-    fn new(blockheight: u32, txid: Txid, tweak: &TweakData) -> TweakTxRow {
+    pub fn new(blockheight: u32, txid: Txid, tweak: &TweakData) -> TweakTxRow {
         TweakTxRow {
             key: TweakTxKey {
                 code: b'K',

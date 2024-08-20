@@ -19,14 +19,17 @@ use bitcoin::consensus::encode::serialize_hex;
 #[cfg(feature = "liquid")]
 use elements::encode::serialize_hex;
 
-use crate::chain::Txid;
+use crate::chain::{OutPoint, Txid};
 use crate::config::{Config, RpcLogging};
 use crate::electrum::{get_electrum_height, ProtocolVersion};
 use crate::errors::*;
 use crate::metrics::{Gauge, HistogramOpts, HistogramVec, MetricOpts, Metrics};
+use crate::new_index::schema::{TweakData, TweakTxRow};
 use crate::new_index::{Query, Utxo};
 use crate::util::electrum_merkle::{get_header_merkle_proof, get_id_from_pos, get_tx_merkle_proof};
-use crate::util::{create_socket, spawn_thread, BlockId, BoolThen, Channel, FullHash, HeaderEntry};
+use crate::util::{
+    bincode, create_socket, spawn_thread, BlockId, BoolThen, Channel, FullHash, HeaderEntry,
+};
 
 const ELECTRS_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 4);
@@ -300,7 +303,8 @@ impl Connection {
         let count: u32 = usize_from_value(params.get(1), "count")?
             .try_into()
             .unwrap();
-        // let historical = bool_from_value_or(params.get(2), "historical", false);
+        let historical_mode =
+            bool_from_value_or(params.get(2), "historical", false).unwrap_or(false);
 
         let sp_begin_height = self.query.sp_begin_height();
         let last_header_entry = self.query.chain().best_header();
@@ -311,6 +315,7 @@ impl Connection {
         } else {
             height
         };
+        let scan_height = height;
 
         let heights = scan_height + count;
         let final_height = if last_height < heights {
@@ -333,13 +338,72 @@ impl Connection {
                 let mut vout_map = HashMap::new();
 
                 for vout in tweak.vout_data.clone().into_iter() {
-                    let items = json!([
+                    let mut spend = vout.spending_input.clone();
+                    let mut has_been_spent = spend.is_some();
+
+                    let cached_height_for_tweak =
+                        self.query.chain().get_tweak_cached_height(h).unwrap_or(0);
+                    let query_cached = last_height == cached_height_for_tweak;
+                    let should_query = !has_been_spent && !query_cached;
+
+                    info!(
+                        "last_height: {:?}, tweak_cached_height: {:?}, in_cache_period: {:?}, should_query: {:?}",
+                        last_height,
+                        cached_height_for_tweak,
+                        query_cached,
+                        should_query,
+                    );
+
+                    if should_query {
+                        spend = self.query.lookup_spend(&OutPoint {
+                            txid: txid.clone(),
+                            vout: vout.vout as u32,
+                        });
+
+                        has_been_spent = spend.is_some();
+                        let mut new_tweak = tweak.clone();
+                        new_tweak
+                            .vout_data
+                            .iter_mut()
+                            .find(|v| v.vout == vout.vout)
+                            .unwrap()
+                            .spending_input = spend.clone();
+
+                        let row = TweakTxRow::new(h, txid.clone(), &new_tweak);
+                        self.query.chain().store().tweak_db().put(
+                            &bincode::serialize_big(&row.key).unwrap(),
+                            &bincode::serialize_big(&row.value).unwrap(),
+                        );
+                    }
+
+                    if has_been_spent {
+                        info!("spend: {:?}", spend);
+                    }
+
+                    let skip_this_vout = !historical_mode && has_been_spent;
+                    if skip_this_vout {
+                        continue;
+                    }
+
+                    let mut items = json!([
                         regex::Regex::new(r"^225120")
                             .unwrap()
                             .replace(&serialize_hex(&vout.script_pubkey), ""),
                         vout.amount
                     ]);
+
+                    if historical_mode && has_been_spent {
+                        items
+                            .as_array_mut()
+                            .unwrap()
+                            .push(serde_json::to_value(&spend).unwrap());
+                    }
+
                     vout_map.insert(vout.vout, items);
+                }
+
+                if vout_map.is_empty() {
+                    continue;
                 }
 
                 tweak_map.insert(
@@ -350,6 +414,8 @@ impl Connection {
                     }),
                 );
             }
+
+            self.query.chain().store_tweak_cache_height(h, last_height);
 
             let _ = self.send_values(&[json!({"jsonrpc":"2.0","method":"blockchain.tweaks.subscribe","params":[{ h.to_string(): tweak_map }]})]);
         }
