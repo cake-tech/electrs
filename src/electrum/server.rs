@@ -327,7 +327,6 @@ impl Connection {
         } else {
             height
         };
-        let scan_height = height;
 
         let heights = scan_height + count;
         let final_height = if last_height < heights {
