@@ -358,14 +358,6 @@ impl Connection {
                     let query_cached = last_height == cached_height_for_tweak;
                     let should_query = !has_been_spent && !query_cached;
 
-                    info!(
-                        "last_height: {:?}, tweak_cached_height: {:?}, in_cache_period: {:?}, should_query: {:?}",
-                        last_height,
-                        cached_height_for_tweak,
-                        query_cached,
-                        should_query,
-                    );
-
                     if should_query {
                         spend = self.query.lookup_spend(&OutPoint {
                             txid: txid.clone(),
@@ -386,10 +378,6 @@ impl Connection {
                             &bincode::serialize_big(&row.key).unwrap(),
                             &bincode::serialize_big(&row.value).unwrap(),
                         );
-                    }
-
-                    if has_been_spent {
-                        info!("spend: {:?}", spend);
                     }
 
                     let skip_this_vout = !historical_mode && has_been_spent;
