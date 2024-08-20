@@ -44,7 +44,7 @@ use crate::new_index::fetch::{start_fetcher, BlockEntry, FetchFrom};
 use crate::elements::{asset, peg};
 
 const MIN_HISTORY_ITEMS_TO_CACHE: usize = 100;
-const MIN_SP_TWEAK_HEIGHT: usize = 823_807; // 01/01/2024
+pub const MIN_SP_TWEAK_HEIGHT: usize = 823_807; // 01/01/2024
 
 pub struct Store {
     // TODO: should be column families
