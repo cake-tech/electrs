@@ -294,6 +294,18 @@ impl Connection {
         Ok(status_hash)
     }
 
+    fn blockchain_scripthash_unsubscribe(&mut self, params: &[Value]) -> Result<Value> {
+        let script_hash = hash_from_value(params.get(0)).chain_err(|| "bad script_hash")?;
+
+        match self.status_hashes.remove(&script_hash) {
+            None => Ok(json!(false)),
+            Some(_) => {
+                self.stats.subscriptions.dec();
+                Ok(json!(true))
+            }
+        }
+    }
+
     // Progressively receive block tweak data per height iteration
     // Client is expected to actively listen for messages until "done"
     pub fn tweaks_subscribe(&mut self, params: &[Value]) -> Result<Value> {
@@ -566,6 +578,7 @@ impl Connection {
             "blockchain.scripthash.get_history" => self.blockchain_scripthash_get_history(&params),
             "blockchain.scripthash.listunspent" => self.blockchain_scripthash_listunspent(&params),
             "blockchain.scripthash.subscribe" => self.blockchain_scripthash_subscribe(&params),
+            "blockchain.scripthash.unsubscribe" => self.blockchain_scripthash_unsubscribe(&params),
             "blockchain.transaction.broadcast" => self.blockchain_transaction_broadcast(&params),
             "blockchain.transaction.get" => self.blockchain_transaction_get(&params),
             "blockchain.transaction.get_merkle" => self.blockchain_transaction_get_merkle(&params),
