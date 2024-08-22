@@ -155,6 +155,31 @@ pub struct SpendingInput {
     pub confirmed: Option<BlockId>,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ScriptStats {
+    pub tx_count: usize,
+    pub funded_txo_count: usize,
+    pub spent_txo_count: usize,
+    #[cfg(not(feature = "liquid"))]
+    pub funded_txo_sum: u64,
+    #[cfg(not(feature = "liquid"))]
+    pub spent_txo_sum: u64,
+}
+
+impl ScriptStats {
+    pub fn default() -> Self {
+        ScriptStats {
+            tx_count: 0,
+            funded_txo_count: 0,
+            spent_txo_count: 0,
+            #[cfg(not(feature = "liquid"))]
+            funded_txo_sum: 0,
+            #[cfg(not(feature = "liquid"))]
+            spent_txo_sum: 0,
+        }
+    }
+}
+
 pub struct Indexer {
     store: Arc<Store>,
     flush: DBFlush,
@@ -204,6 +229,7 @@ pub struct ChainQuery {
     network: Network,
 }
 
+// TODO: &[Block] should be an iterator / a queue.
 impl Indexer {
     pub fn open(store: Arc<Store>, from: FetchFrom, config: &Config, metrics: &Metrics) -> Self {
         Indexer {
@@ -335,7 +361,7 @@ impl Indexer {
                     self.from
                 );
                 start_fetcher(self.from, &daemon, to_index)?.map(|blocks| self.index(&blocks));
-                self.start_auto_compactions(&self.store.history_db());
+                self.start_auto_compactions(&self.store.history_db);
             }
         } else {
             debug!("Skipping history indexing");
@@ -360,14 +386,14 @@ impl Indexer {
 
         if let DBFlush::Disable = self.flush {
             debug!("flushing to disk");
-            self.store.txstore_db().flush();
-            self.store.history_db().flush();
+            self.store.txstore_db.flush();
+            self.store.history_db.flush();
             self.flush = DBFlush::Enable;
         }
 
         // update the synced tip *after* the new data is flushed to disk
         debug!("updating synced tip to {:?}", tip);
-        self.store.txstore_db().put_sync(b"t", &serialize(&tip));
+        self.store.txstore_db.put_sync(b"t", &serialize(&tip));
 
         let mut headers = self.store.indexed_headers.write().unwrap();
         headers.apply(headers_not_indexed);
@@ -392,7 +418,7 @@ impl Indexer {
         };
         {
             let _timer = self.start_timer("add_write");
-            self.store.txstore_db().write(rows, self.flush);
+            self.store.txstore_db.write(rows, self.flush);
         }
 
         self.store
@@ -405,7 +431,7 @@ impl Indexer {
     fn index(&self, blocks: &[BlockEntry]) {
         let previous_txos_map = {
             let _timer = self.start_timer("index_lookup");
-            lookup_txos(&self.store.txstore_db(), get_previous_txos(blocks)).unwrap()
+            lookup_txos(&self.store.txstore_db, get_previous_txos(blocks)).unwrap()
         };
         let rows = {
             let _timer = self.start_timer("index_process");
@@ -510,7 +536,7 @@ impl Indexer {
                 .flatten()
                 .collect()
         };
-        self.store.history_db().write(rows, self.flush);
+        self.store.history_db.write(rows, self.flush);
     }
 
     fn tweak(&self, blocks: &[BlockEntry], daemon: &Daemon, total: usize) {
@@ -657,7 +683,7 @@ impl Indexer {
         let _timer = self.start_timer("tx_confirming_block");
         let headers = self.store.indexed_headers.read().unwrap();
         self.store
-            .txstore_db()
+            .txstore_db
             .iter_scan(&TxConfRow::filter(&txid[..]))
             .map(TxConfRow::from_row)
             // header_by_blockhash only returns blocks that are part of the best chain,
@@ -671,7 +697,7 @@ impl Indexer {
     pub fn lookup_spend(&self, outpoint: &OutPoint) -> Option<SpendingInput> {
         let _timer = self.start_timer("lookup_spend");
         self.store
-            .history_db()
+            .history_db
             .iter_scan(&TxEdgeRow::filter(&outpoint))
             .map(TxEdgeRow::from_row)
             .find_map(|edge| {
@@ -682,31 +708,6 @@ impl Indexer {
                     confirmed: Some(b),
                 })
             })
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct ScriptStats {
-    pub tx_count: usize,
-    pub funded_txo_count: usize,
-    pub spent_txo_count: usize,
-    #[cfg(not(feature = "liquid"))]
-    pub funded_txo_sum: u64,
-    #[cfg(not(feature = "liquid"))]
-    pub spent_txo_sum: u64,
-}
-
-impl ScriptStats {
-    pub fn default() -> Self {
-        ScriptStats {
-            tx_count: 0,
-            funded_txo_count: 0,
-            spent_txo_count: 0,
-            #[cfg(not(feature = "liquid"))]
-            funded_txo_sum: 0,
-            #[cfg(not(feature = "liquid"))]
-            spent_txo_sum: 0,
-        }
     }
 }
 
@@ -1582,13 +1583,13 @@ struct TxRowKey {
     txid: FullHash,
 }
 
-pub struct TxRow {
+struct TxRow {
     key: TxRowKey,
     value: Bytes, // raw transaction
 }
 
 impl TxRow {
-    pub fn new(txn: &Transaction) -> TxRow {
+    fn new(txn: &Transaction) -> TxRow {
         let txid = full_hash(&txn.txid()[..]);
         TxRow {
             key: TxRowKey { code: b'T', txid },
@@ -1600,7 +1601,7 @@ impl TxRow {
         [b"T", prefix].concat()
     }
 
-    pub fn into_row(self) -> DBRow {
+    fn into_row(self) -> DBRow {
         let TxRow { key, value } = self;
         DBRow {
             key: bincode::serialize_little(&key).unwrap(),
@@ -1610,18 +1611,18 @@ impl TxRow {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct TxConfKey {
+struct TxConfKey {
     code: u8,
     txid: FullHash,
-    pub blockhash: FullHash,
+    blockhash: FullHash,
 }
 
-pub struct TxConfRow {
-    pub key: TxConfKey,
+struct TxConfRow {
+    key: TxConfKey,
 }
 
 impl TxConfRow {
-    pub fn new(txn: &Transaction, blockhash: FullHash) -> TxConfRow {
+    fn new(txn: &Transaction, blockhash: FullHash) -> TxConfRow {
         let txid = full_hash(&txn.txid()[..]);
         TxConfRow {
             key: TxConfKey {
@@ -1632,18 +1633,18 @@ impl TxConfRow {
         }
     }
 
-    pub fn filter(prefix: &[u8]) -> Bytes {
+    fn filter(prefix: &[u8]) -> Bytes {
         [b"C", prefix].concat()
     }
 
-    pub fn into_row(self) -> DBRow {
+    fn into_row(self) -> DBRow {
         DBRow {
             key: bincode::serialize_little(&self.key).unwrap(),
             value: vec![],
         }
     }
 
-    pub fn from_row(row: DBRow) -> Self {
+    fn from_row(row: DBRow) -> Self {
         TxConfRow {
             key: bincode::deserialize_little(&row.key).expect("failed to parse TxConfKey"),
         }
@@ -1657,13 +1658,13 @@ struct TxOutKey {
     vout: u16,
 }
 
-pub struct TxOutRow {
+struct TxOutRow {
     key: TxOutKey,
     value: Bytes, // serialized output
 }
 
 impl TxOutRow {
-    pub fn new(txid: &FullHash, vout: usize, txout: &TxOut) -> TxOutRow {
+    fn new(txid: &FullHash, vout: usize, txout: &TxOut) -> TxOutRow {
         TxOutRow {
             key: TxOutKey {
                 code: b'O',
@@ -1682,7 +1683,7 @@ impl TxOutRow {
         .unwrap()
     }
 
-    pub fn into_row(self) -> DBRow {
+    fn into_row(self) -> DBRow {
         DBRow {
             key: bincode::serialize_little(&self.key).unwrap(),
             value: self.value,
@@ -1696,13 +1697,13 @@ struct BlockKey {
     hash: FullHash,
 }
 
-pub struct BlockRow {
+struct BlockRow {
     key: BlockKey,
     value: Bytes, // serialized output
 }
 
 impl BlockRow {
-    pub fn new_header(block_entry: &BlockEntry) -> BlockRow {
+    fn new_header(block_entry: &BlockEntry) -> BlockRow {
         BlockRow {
             key: BlockKey {
                 code: b'B',
@@ -1712,28 +1713,28 @@ impl BlockRow {
         }
     }
 
-    pub fn new_txids(hash: FullHash, txids: &[Txid]) -> BlockRow {
+    fn new_txids(hash: FullHash, txids: &[Txid]) -> BlockRow {
         BlockRow {
             key: BlockKey { code: b'X', hash },
             value: bincode::serialize_little(txids).unwrap(),
         }
     }
 
-    pub fn new_meta(hash: FullHash, meta: &BlockMeta) -> BlockRow {
+    fn new_meta(hash: FullHash, meta: &BlockMeta) -> BlockRow {
         BlockRow {
             key: BlockKey { code: b'M', hash },
             value: bincode::serialize_little(meta).unwrap(),
         }
     }
 
-    pub fn new_tweaks(hash: FullHash, tweaks: &[Vec<u8>]) -> BlockRow {
+    fn new_tweaks(hash: FullHash, tweaks: &[Vec<u8>]) -> BlockRow {
         BlockRow {
             key: BlockKey { code: b'W', hash },
             value: bincode::serialize_little(tweaks).unwrap(),
         }
     }
 
-    pub fn new_done(hash: FullHash) -> BlockRow {
+    fn new_done(hash: FullHash) -> BlockRow {
         BlockRow {
             key: BlockKey { code: b'D', hash },
             value: vec![],
@@ -1760,7 +1761,7 @@ impl BlockRow {
         b"D".to_vec()
     }
 
-    pub fn into_row(self) -> DBRow {
+    fn into_row(self) -> DBRow {
         DBRow {
             key: bincode::serialize_little(&self.key).unwrap(),
             value: self.value,
