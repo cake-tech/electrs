@@ -369,15 +369,18 @@ impl Indexer {
 
         if !self.iconfig.skip_tweaks {
             let to_tweak = self.headers_to_tweak(&headers_not_indexed);
-            let total = to_tweak.len();
             if !to_tweak.is_empty() {
                 debug!(
                     "indexing sp tweaks from {} blocks using {:?}",
                     to_tweak.len(),
                     self.from
                 );
+
+                let total = to_tweak.len();
+                let count = Arc::new(AtomicUsize::new(0));
+
                 start_fetcher(self.from, &daemon, to_tweak)?
-                    .map(|blocks| self.tweak(&blocks, &daemon, total));
+                    .map(|blocks| self.tweak(&blocks, &daemon, total, &count));
                 self.start_auto_compactions(&self.store.tweak_db());
             }
         } else {
@@ -429,36 +432,22 @@ impl Indexer {
     }
 
     fn index(&self, blocks: &[BlockEntry]) {
-        let previous_txos_map = {
-            let _timer = self.start_timer("index_lookup");
-            lookup_txos(&self.store.txstore_db, get_previous_txos(blocks)).unwrap()
-        };
         let rows = {
             let _timer = self.start_timer("index_process");
-            let added_blockhashes = self.store.added_blockhashes.read().unwrap();
-            for b in blocks {
-                let blockhash = b.entry.hash();
-                // TODO: replace by lookup into txstore_db?
-                if !added_blockhashes.contains(blockhash) {
-                    panic!("cannot index block {} (missing from store)", blockhash);
-                }
-            }
-
             blocks
                 .par_iter() // serialization is CPU-intensive
                 .map(|b| {
+                    let height = b.entry.height() as u32;
+                    debug!("indexing block {}", height);
+
                     let mut rows = vec![];
                     for tx in &b.block.txdata {
-                        let height = b.entry.height() as u32;
-
-                        // TODO: return an iterator?
-
+                        let txid = full_hash(&tx.txid()[..]);
                         // persist history index:
                         //      H{funding-scripthash}{funding-height}F{funding-txid:vout} → ""
                         //      H{funding-scripthash}{spending-height}S{spending-txid:vin}{funding-txid:vout} → ""
                         // persist "edges" for fast is-this-TXO-spent check
                         //      S{funding-txid:vout}{spending-txid:vin} → ""
-                        let txid = full_hash(&tx.txid()[..]);
                         for (txo_index, txo) in tx.output.iter().enumerate() {
                             if is_spendable(txo) || self.iconfig.index_unspendables {
                                 let history = TxHistoryRow::new(
@@ -487,8 +476,7 @@ impl Indexer {
                             if !has_prevout(txi) {
                                 continue;
                             }
-                            let prev_txo = previous_txos_map
-                                .get(&txi.previous_output)
+                            let prev_txo = lookup_txo(&self.store.txstore_db, &txi.previous_output)
                                 .unwrap_or_else(|| {
                                     panic!("missing previous txo {}", txi.previous_output)
                                 });
@@ -525,6 +513,7 @@ impl Indexer {
                             &mut rows,
                         );
                     }
+
                     rows.push(BlockRow::new_done(full_hash(&b.entry.hash()[..])).into_row()); // mark block as "indexed"
                     rows
                 })
@@ -534,47 +523,54 @@ impl Indexer {
         self.store.history_db.write(rows, self.flush);
     }
 
-    fn tweak(&self, blocks: &[BlockEntry], daemon: &Daemon, total: usize) {
-        let _timer = self.start_timer("tweak_process");
-        let tweaked_blocks = Arc::new(AtomicUsize::new(0));
-        let _: Vec<_> = blocks
-            .par_iter() // serialization is CPU-intensive
-            .map(|b| {
-                let mut rows = vec![];
-                let mut tweaks: Vec<Vec<u8>> = vec![];
-                let blockhash = full_hash(&b.entry.hash()[..]);
-                let blockheight = b.entry.height();
+    fn tweak(
+        &self,
+        blocks: &[BlockEntry],
+        daemon: &Daemon,
+        total: usize,
+        count: &Arc<AtomicUsize>,
+    ) {
+        let rows = {
+            let _timer = self.start_timer("tweak_process");
+            blocks
+                .par_iter() // serialization is CPU-intensive
+                .map(|b| {
+                    let mut rows = vec![];
+                    let mut tweaks: Vec<Vec<u8>> = vec![];
+                    let blockhash = full_hash(&b.entry.hash()[..]);
+                    let blockheight = b.entry.height();
 
-                for tx in &b.block.txdata {
-                    self.tweak_transaction(
-                        blockheight.try_into().unwrap(),
-                        tx,
-                        &mut rows,
-                        &mut tweaks,
-                        daemon,
+                    for tx in &b.block.txdata {
+                        self.tweak_transaction(
+                            blockheight.try_into().unwrap(),
+                            tx,
+                            &mut rows,
+                            &mut tweaks,
+                            daemon,
+                        );
+                    }
+
+                    // persist block tweaks index:
+                    //      W{blockhash} → {tweak1}...{tweakN}
+                    rows.push(BlockRow::new_tweaks(blockhash, &tweaks).into_row());
+                    rows.push(BlockRow::new_done(blockhash).into_row());
+
+                    count.fetch_add(1, Ordering::SeqCst);
+                    info!(
+                        "Sp tweaked block {} of {} total (height: {})",
+                        count.load(Ordering::SeqCst),
+                        total,
+                        b.entry.height()
                     );
-                }
 
-                // persist block tweaks index:
-                //      W{blockhash} → {tweak1}...{tweakN}
-                rows.push(BlockRow::new_tweaks(blockhash, &tweaks).into_row());
-                rows.push(BlockRow::new_done(blockhash).into_row());
+                    rows
+                })
+                .flatten()
+                .collect()
+        };
 
-                self.store.tweak_db().write(rows, self.flush);
-                self.store.tweak_db().flush();
-
-                tweaked_blocks.fetch_add(1, Ordering::SeqCst);
-                info!(
-                    "Sp tweaked block {} of {} total (height: {})",
-                    tweaked_blocks.load(Ordering::SeqCst),
-                    total,
-                    b.entry.height()
-                );
-
-                Some(())
-            })
-            .flatten()
-            .collect();
+        self.store.tweak_db().write(rows, self.flush);
+        self.store.tweak_db().flush();
     }
 
     fn tweak_transaction(
