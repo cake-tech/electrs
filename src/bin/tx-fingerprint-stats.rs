@@ -41,20 +41,9 @@ fn main() {
         .unwrap(),
     );
 
-    let chain = Arc::new(ChainQuery::new(
-        Arc::clone(&store),
-        Arc::clone(&daemon),
-        &config,
-        &metrics,
-    ));
+    let chain = ChainQuery::new(Arc::clone(&store), Arc::clone(&daemon), &config, &metrics);
 
-    let mut indexer = Indexer::open(
-        Arc::clone(&store),
-        FetchFrom::Bitcoind,
-        &config,
-        &metrics,
-        &chain,
-    );
+    let mut indexer = Indexer::open(Arc::clone(&store), FetchFrom::Bitcoind, &config, &metrics);
     indexer.update(&daemon).unwrap();
 
     let mut iter = store.txstore_db().raw_iterator();
@@ -93,13 +82,15 @@ fn main() {
 
         //info!("{:?},{:?}", txid, blockid);
 
-        let prevouts = chain.lookup_txos(
-            tx.input
-                .iter()
-                .filter(|txin| has_prevout(txin))
-                .map(|txin| txin.previous_output)
-                .collect(),
-        ).unwrap();
+        let prevouts = chain
+            .lookup_txos(
+                tx.input
+                    .iter()
+                    .filter(|txin| has_prevout(txin))
+                    .map(|txin| txin.previous_output)
+                    .collect(),
+            )
+            .unwrap();
 
         let total_out: u64 = tx.output.iter().map(|out| out.value.to_sat()).sum();
         let small_out = tx

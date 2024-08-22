@@ -55,6 +55,12 @@ fn run_server(config: Arc<Config>) -> Result<()> {
         &metrics,
     )?);
     let store = Arc::new(Store::open(&config.db_path.join("newindex"), &config));
+    let mut indexer = Indexer::open(
+        Arc::clone(&store),
+        fetch_from(&config, &store),
+        &config,
+        &metrics,
+    );
 
     let chain = Arc::new(ChainQuery::new(
         Arc::clone(&store),
@@ -63,13 +69,6 @@ fn run_server(config: Arc<Config>) -> Result<()> {
         &metrics,
     ));
 
-    let mut indexer = Indexer::open(
-        Arc::clone(&store),
-        fetch_from(&config, &store),
-        &config,
-        &metrics,
-        &chain,
-    );
     let mut tip = indexer.update(&daemon)?;
     if let Some(ref precache_file) = config.precache_scripts {
         let precache_scripthashes = precache::scripthashes_from_file(precache_file.to_string())

@@ -24,11 +24,12 @@ use crate::config::{Config, RpcLogging};
 use crate::electrum::{get_electrum_height, ProtocolVersion};
 use crate::errors::*;
 use crate::metrics::{Gauge, HistogramOpts, HistogramVec, MetricOpts, Metrics};
-use crate::new_index::schema::{TweakData, TweakTxRow};
+use crate::new_index::schema::TweakTxRow;
 use crate::new_index::{Query, Utxo};
 use crate::util::electrum_merkle::{get_header_merkle_proof, get_id_from_pos, get_tx_merkle_proof};
 use crate::util::{
     bincode, create_socket, spawn_thread, BlockId, BoolThen, Channel, FullHash, HeaderEntry,
+    ScriptToAsm,
 };
 
 const ELECTRS_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -384,21 +385,24 @@ impl Connection {
                         continue;
                     }
 
-                    let mut items = json!([
-                        regex::Regex::new(r"^225120")
-                            .unwrap()
-                            .replace(&serialize_hex(&vout.script_pubkey), ""),
-                        vout.amount
-                    ]);
+                    if let Some(pubkey) = &vout
+                        .script_pubkey
+                        .to_asm()
+                        .split(" ")
+                        .collect::<Vec<&str>>()
+                        .last()
+                    {
+                        let mut items = json!([pubkey, vout.amount]);
 
-                    if historical_mode && has_been_spent {
-                        items
-                            .as_array_mut()
-                            .unwrap()
-                            .push(serde_json::to_value(&spend).unwrap());
+                        if historical_mode && has_been_spent {
+                            items
+                                .as_array_mut()
+                                .unwrap()
+                                .push(serde_json::to_value(&spend).unwrap());
+                        }
+
+                        vout_map.insert(vout.vout, items);
                     }
-
-                    vout_map.insert(vout.vout, items);
                 }
 
                 if vout_map.is_empty() {

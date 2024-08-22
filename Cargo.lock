@@ -675,7 +675,6 @@ dependencies = [
  "page_size",
  "prometheus",
  "rayon",
- "regex",
  "rocksdb",
  "rust-crypto",
  "serde",

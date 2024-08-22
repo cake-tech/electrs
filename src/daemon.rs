@@ -527,10 +527,6 @@ impl Daemon {
         self.request("getrawtransaction", json!([txid, verbose, blockhash]))
     }
 
-    pub(crate) fn gettxout(&self, txid: &Txid, vout: u32, include_mempool: bool) -> Result<Value> {
-        self.request("gettxout", json!([txid, vout, include_mempool]))
-    }
-
     pub fn getmempooltx(&self, txhash: &Txid) -> Result<Transaction> {
         let value = self.request("getrawtransaction", json!([txhash, /*verbose=*/ false]))?;
         tx_from_value(value)
