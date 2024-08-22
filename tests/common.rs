@@ -146,16 +146,16 @@ impl TestRunner {
             FetchFrom::Bitcoind
         };
 
+        let mut indexer = Indexer::open(Arc::clone(&store), fetch_from, &config, &metrics, &chain);
+        indexer.update(&daemon)?;
+        indexer.fetch_from(FetchFrom::Bitcoind);
+
         let chain = Arc::new(ChainQuery::new(
             Arc::clone(&store),
             Arc::clone(&daemon),
             &config,
             &metrics,
         ));
-
-        let mut indexer = Indexer::open(Arc::clone(&store), fetch_from, &config, &metrics, &chain);
-        indexer.update(&daemon)?;
-        indexer.fetch_from(FetchFrom::Bitcoind);
 
         let mempool = Arc::new(RwLock::new(Mempool::new(
             Arc::clone(&chain),

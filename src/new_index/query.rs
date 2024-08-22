@@ -18,8 +18,7 @@ use crate::{
     elements::{lookup_asset, AssetRegistry, AssetSorting, LiquidAsset},
 };
 
-use super::indexer::MIN_SP_TWEAK_HEIGHT;
-use super::schema::TweakData;
+use super::schema::{TweakData, MIN_SP_TWEAK_HEIGHT};
 
 const FEE_ESTIMATES_TTL: u64 = 60; // seconds
 

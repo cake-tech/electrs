@@ -521,6 +521,7 @@ impl Daemon {
     pub fn gettransaction_raw(
         &self,
         txid: &Txid,
+        // WARN: gettransaction_raw with blockhash=None requires bitcoind with txindex=1
         blockhash: Option<&BlockHash>,
         verbose: bool,
     ) -> Result<Value> {
