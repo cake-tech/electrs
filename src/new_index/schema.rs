@@ -475,13 +475,8 @@ impl Indexer {
                                 // for prefix address search, only saved when --address-search is enabled
                                 //      a{funding-address-str} → ""
                                 if self.iconfig.address_search {
-                                    if let Some(row) = txo
-                                        .script_pubkey
-                                        .to_address_str(self.iconfig.network)
-                                        .map(|address| DBRow {
-                                            key: [b"a", address.as_bytes()].concat(),
-                                            value: vec![],
-                                        })
+                                    if let Some(row) =
+                                        addr_search_row(&txo.script_pubkey, self.iconfig.network)
                                     {
                                         rows.push(row);
                                     }
@@ -711,7 +706,6 @@ impl Indexer {
     }
 }
 
-// TODO: &[Block] should be an iterator / a queue.
 impl ChainQuery {
     pub fn new(store: Arc<Store>, daemon: Arc<Daemon>, config: &Config, metrics: &Metrics) -> Self {
         ChainQuery {
@@ -1558,6 +1552,14 @@ impl TweakTxRow {
         self.value.clone()
     }
 }
+
+fn addr_search_row(spk: &Script, network: Network) -> Option<DBRow> {
+    spk.to_address_str(network).map(|address| DBRow {
+        key: [b"a", address.as_bytes()].concat(),
+        value: vec![],
+    })
+}
+
 fn addr_search_filter(prefix: &str) -> Bytes {
     [b"a", prefix.as_bytes()].concat()
 }
@@ -1836,7 +1838,7 @@ pub struct TxHistoryRow {
 }
 
 impl TxHistoryRow {
-    pub fn new(script: &Script, confirmed_height: u32, txinfo: TxHistoryInfo) -> Self {
+    fn new(script: &Script, confirmed_height: u32, txinfo: TxHistoryInfo) -> Self {
         let key = TxHistoryKey {
             code: b'H',
             hash: compute_script_hash(&script),
@@ -1901,20 +1903,20 @@ impl TxHistoryInfo {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct TxEdgeKey {
+struct TxEdgeKey {
     code: u8,
     funding_txid: FullHash,
     funding_vout: u16,
-    pub spending_txid: FullHash,
-    pub spending_vin: u16,
+    spending_txid: FullHash,
+    spending_vin: u16,
 }
 
-pub struct TxEdgeRow {
-    pub key: TxEdgeKey,
+struct TxEdgeRow {
+    key: TxEdgeKey,
 }
 
 impl TxEdgeRow {
-    pub fn new(
+    fn new(
         funding_txid: FullHash,
         funding_vout: u16,
         spending_txid: FullHash,
@@ -1930,20 +1932,20 @@ impl TxEdgeRow {
         TxEdgeRow { key }
     }
 
-    pub fn filter(outpoint: &OutPoint) -> Bytes {
+    fn filter(outpoint: &OutPoint) -> Bytes {
         // TODO build key without using bincode? [ b"S", &outpoint.txid[..], outpoint.vout?? ].concat()
         bincode::serialize_little(&(b'S', full_hash(&outpoint.txid[..]), outpoint.vout as u16))
             .unwrap()
     }
 
-    pub fn into_row(self) -> DBRow {
+    fn into_row(self) -> DBRow {
         DBRow {
             key: bincode::serialize_little(&self.key).unwrap(),
             value: vec![],
         }
     }
 
-    pub fn from_row(row: DBRow) -> Self {
+    fn from_row(row: DBRow) -> Self {
         TxEdgeRow {
             key: bincode::deserialize_little(&row.key).expect("failed to deserialize TxEdgeKey"),
         }
