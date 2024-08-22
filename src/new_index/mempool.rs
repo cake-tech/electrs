@@ -410,12 +410,13 @@ impl Mempool {
             .start_timer();
 
         // Get the txos available in the mempool, skipping over (and collecting) missing ones
-        let (mut txos, remain_outpoints): (HashMap<_, _>, _) = outpoints
-            .into_iter()
-            .partition_map(|outpoint| match self.lookup_txo(&outpoint) {
-                Some(txout) => Either::Left((outpoint, txout)),
-                None => Either::Right(outpoint),
-            });
+        let (mut txos, remain_outpoints): (HashMap<_, _>, _) =
+            outpoints
+                .into_iter()
+                .partition_map(|outpoint| match self.lookup_txo(&outpoint) {
+                    Some(txout) => Either::Left((outpoint, txout)),
+                    None => Either::Right(outpoint),
+                });
 
         // Get the remaining txos from the chain (fails if any are missing)
         txos.extend(self.chain.lookup_txos(remain_outpoints)?);
@@ -513,7 +514,7 @@ impl Mempool {
             .chain_err(|| format!("failed to get {} transactions", new_txids.len()))?;
 
         // 4. Update local mempool to match daemon's state
-        {
+        if !mempool.read().unwrap().config.skip_mempool {
             let mut mempool = mempool.write().unwrap();
             // Add new transactions
             mempool.add(txs_to_add);
@@ -527,6 +528,8 @@ impl Mempool {
             if mempool.backlog_stats.1.elapsed() > Duration::from_secs(BACKLOG_STATS_TTL) {
                 mempool.update_backlog_stats();
             }
+        } else {
+            debug!("Skipping mempool update");
         }
 
         Ok(())

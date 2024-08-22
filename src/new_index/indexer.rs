@@ -43,8 +43,7 @@ use crate::new_index::{
     Store,
 };
 
-// const MIN_SP_TWEAK_HEIGHT: usize = 823_807; // 01/01/2024
-pub const MIN_SP_TWEAK_HEIGHT: usize = 857_625;
+pub const MIN_SP_TWEAK_HEIGHT: usize = 823_807; // 01/01/2024
 
 pub struct Indexer {
     store: Arc<Store>,
@@ -64,6 +63,9 @@ struct IndexerConfig {
     parent_network: crate::chain::BNetwork,
     sp_begin_height: Option<usize>,
     sp_min_dust: Option<usize>,
+    sp_check_spends: bool,
+    skip_history: bool,
+    skip_tweaks: bool,
 }
 
 impl From<&Config> for IndexerConfig {
@@ -77,6 +79,9 @@ impl From<&Config> for IndexerConfig {
             parent_network: config.parent_network,
             sp_begin_height: config.sp_begin_height,
             sp_min_dust: config.sp_min_dust,
+            sp_check_spends: config.sp_check_spends,
+            skip_history: config.skip_history,
+            skip_tweaks: config.skip_tweaks,
         }
     }
 }
@@ -203,28 +208,36 @@ impl Indexer {
             self.start_auto_compactions(&self.store.txstore_db());
         }
 
-        let to_index = self.headers_to_index(&headers_not_indexed);
-        if !to_index.is_empty() {
-            debug!(
-                "indexing history from {} blocks using {:?}",
-                to_index.len(),
-                self.from
-            );
-            start_fetcher(self.from, &daemon, to_index)?.map(|blocks| self.index(&blocks));
-            self.start_auto_compactions(&self.store.history_db());
+        if !self.iconfig.skip_history {
+            let to_index = self.headers_to_index(&headers_not_indexed);
+            if !to_index.is_empty() {
+                debug!(
+                    "indexing history from {} blocks using {:?}",
+                    to_index.len(),
+                    self.from
+                );
+                start_fetcher(self.from, &daemon, to_index)?.map(|blocks| self.index(&blocks));
+                self.start_auto_compactions(&self.store.history_db());
+            }
+        } else {
+            debug!("Skipping history indexing");
         }
 
-        let to_tweak = self.headers_to_tweak(&headers_not_indexed);
-        let total = to_tweak.len();
-        if !to_tweak.is_empty() {
-            debug!(
-                "indexing sp tweaks from {} blocks using {:?}",
-                to_tweak.len(),
-                self.from
-            );
-            start_fetcher(self.from, &daemon, to_tweak)?
-                .map(|blocks| self.tweak(&blocks, &daemon, total));
-            self.start_auto_compactions(&self.store.tweak_db());
+        if !self.iconfig.skip_tweaks {
+            let to_tweak = self.headers_to_tweak(&headers_not_indexed);
+            let total = to_tweak.len();
+            if !to_tweak.is_empty() {
+                debug!(
+                    "indexing sp tweaks from {} blocks using {:?}",
+                    to_tweak.len(),
+                    self.from
+                );
+                start_fetcher(self.from, &daemon, to_tweak)?
+                    .map(|blocks| self.tweak(&blocks, &daemon, total));
+                self.start_auto_compactions(&self.store.tweak_db());
+            }
+        } else {
+            debug!("Skipping tweaks indexing");
         }
 
         if let DBFlush::Disable = self.flush {
@@ -447,10 +460,14 @@ impl Indexer {
                         vout: txo_index,
                         amount,
                         script_pubkey: txo.script_pubkey.clone(),
-                        spending_input: self.lookup_spend(&OutPoint {
-                            txid: txid.clone(),
-                            vout: txo_index as u32,
-                        }),
+                        spending_input: if self.iconfig.sp_check_spends {
+                            self.lookup_spend(&OutPoint {
+                                txid: txid.clone(),
+                                vout: txo_index as u32,
+                            })
+                        } else {
+                            None
+                        },
                     });
                 }
             }

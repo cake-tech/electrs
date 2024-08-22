@@ -54,6 +54,10 @@ pub struct Config {
     pub tor_proxy: Option<std::net::SocketAddr>,
     pub sp_begin_height: Option<usize>,
     pub sp_min_dust: Option<usize>,
+    pub sp_check_spends: bool,
+    pub skip_history: bool,
+    pub skip_tweaks: bool,
+    pub skip_mempool: bool,
 }
 
 fn str_to_socketaddr(address: &str, what: &str) -> SocketAddr {
@@ -193,6 +197,14 @@ impl Config {
                     .long("electrum-rpc-logging")
                     .help(&rpc_logging_help)
                     .takes_value(true),
+            ).arg(
+            Arg::with_name("skip_history")
+                .long("skip-history")
+                .help("Skip history indexing"),
+        ).arg(
+                Arg::with_name("skip_mempool")
+                    .long("skip-mempool")
+                    .help("Skip local mempool"),
             );
 
         #[cfg(unix)]
@@ -234,6 +246,31 @@ impl Config {
                 .help("ip:addr of socks proxy for accessing onion hosts")
                 .takes_value(true),
         );
+
+        #[cfg(feature = "silent-payments")]
+        let args = args
+            .arg(
+                Arg::with_name("sp_begin_height")
+                    .long("sp-begin-height")
+                    .help("Block height at which to begin scanning for silent payments")
+                    .takes_value(true),
+            )
+            .arg(
+                Arg::with_name("sp_min_dust")
+                    .long("sp-min-dust")
+                    .help("Minimum dust value for silent payments")
+                    .takes_value(true),
+            )
+            .arg(
+                Arg::with_name("sp_check_spends")
+                    .long("sp-check-spends")
+                    .help("Check spends of silent payments"),
+            )
+            .arg(
+                Arg::with_name("skip_tweaks")
+                    .long("skip-tweaks")
+                    .help("Skip tweaks indexing"),
+            );
 
         let m = args.get_matches();
 
@@ -417,8 +454,12 @@ impl Config {
             electrum_announce: m.is_present("electrum_announce"),
             #[cfg(feature = "electrum-discovery")]
             tor_proxy: m.value_of("tor_proxy").map(|s| s.parse().unwrap()),
-            sp_begin_height: None,
-            sp_min_dust: None,
+            sp_begin_height: m.value_of("sp_begin_height").map(|s| s.parse().unwrap()),
+            sp_min_dust: m.value_of("sp_min_dust").map(|s| s.parse().unwrap()),
+            sp_check_spends: m.is_present("sp_check_spends"),
+            skip_history: m.is_present("skip_history"),
+            skip_tweaks: m.is_present("skip_tweaks"),
+            skip_mempool: m.is_present("skip_mempool"),
         };
         eprintln!("{:?}", config);
         config
