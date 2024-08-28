@@ -307,21 +307,47 @@ impl Connection {
         }
     }
 
-    // Progressively receive block tweak data per height iteration
-    // Client is expected to actively listen for messages until "done"
-    pub fn tweaks_subscribe(&mut self, params: &[Value]) -> Result<Value> {
+    pub fn blockchain_block_tweaks(&mut self, params: &[Value]) -> Result<Value> {
         let height: u32 = usize_from_value(params.get(0), "height")?
             .try_into()
             .unwrap();
-        let count: u32 = usize_from_value(params.get(1), "count")?
+        // let _historical_mode =
+        //     bool_from_value_or(params.get(2), "historical", false).unwrap_or(false);
+
+        let sp_begin_height = self.query.sp_begin_height();
+        // let last_header_entry = self.query.chain().best_header();
+
+        let scan_height = if height < sp_begin_height {
+            sp_begin_height
+        } else {
+            height
+        };
+
+        let tweaks = self.query.block_tweaks(scan_height);
+        Ok(json!(tweaks))
+    }
+
+    // Progressively receive block tweak data per height iteration
+    // Client is expected to actively listen for messages until "done"
+    pub fn tweaks_subscribe(&mut self, params: &[Value]) -> Result<Value> {
+        let mut height: u32 = usize_from_value(params.get(0), "height")?
             .try_into()
             .unwrap();
+        let mut count: u32 = usize_from_value(params.get(1), "count")?
+            .try_into()
+            .unwrap();
+        if count > 25 {
+            count = 25;
+        }
         let historical_mode =
             bool_from_value_or(params.get(2), "historical", false).unwrap_or(false);
 
         let sp_begin_height = self.query.sp_begin_height();
         let last_header_entry = self.query.chain().best_header();
         let last_height = last_header_entry.height().try_into().unwrap();
+        if height == 0 {
+            height = last_height;
+        }
 
         let scan_height = if height < sp_begin_height {
             sp_begin_height
@@ -336,79 +362,85 @@ impl Connection {
             heights
         };
 
-        for h in scan_height..=final_height.try_into().unwrap() {
-            let empty = json!({ "jsonrpc":"2.0","method":"blockchain.tweaks.subscribe","params":[{h.to_string(): {}}]});
+        let mut tweak_map = HashMap::new();
+        let mut prev_height = scan_height;
 
-            let tweaks = self.query.tweaks(h);
-            if tweaks.is_empty() {
-                self.send_values(&[empty.clone()])?;
-                continue;
-            }
+        let tweaked_blockhashes = self.query.chain().store().tweaked_blockhashes().len() as u32;
+        let should_reverse = scan_height > tweaked_blockhashes / 2;
+        let rows: Vec<_> = if should_reverse {
+            self.query.tweaks_iter_scan_reverse(scan_height).collect()
+        } else {
+            self.query.tweaks_iter_scan(scan_height).collect()
+        };
 
-            let mut tweak_map = HashMap::new();
-            for (txid, tweak) in tweaks.iter() {
-                let mut vout_map = HashMap::new();
+        for row in rows {
+            let tweak_row = TweakTxRow::from_row(row);
+            let row_height = tweak_row.key.blockheight;
 
-                for vout in tweak.vout_data.clone().into_iter() {
-                    let mut spend = vout.spending_input.clone();
-                    let mut has_been_spent = spend.is_some();
+            let txid = tweak_row.key.txid;
+            let tweak = tweak_row.get_tweak_data();
+            let mut vout_map = HashMap::new();
 
-                    let cached_height_for_tweak =
-                        self.query.chain().get_tweak_cached_height(h).unwrap_or(0);
-                    let query_cached = last_height == cached_height_for_tweak;
-                    let should_query = !has_been_spent && !query_cached;
+            for vout in tweak.vout_data.clone().into_iter() {
+                let mut spend = vout.spending_input.clone();
+                let mut has_been_spent = spend.is_some();
 
-                    if should_query {
-                        spend = self.query.lookup_spend(&OutPoint {
-                            txid: txid.clone(),
-                            vout: vout.vout as u32,
-                        });
+                let cached_height_for_tweak = self
+                    .query
+                    .chain()
+                    .get_tweak_cached_height(row_height)
+                    .unwrap_or(0);
+                let query_cached = last_height == cached_height_for_tweak;
+                let should_query = !has_been_spent && !query_cached;
 
-                        has_been_spent = spend.is_some();
-                        let mut new_tweak = tweak.clone();
-                        new_tweak
-                            .vout_data
-                            .iter_mut()
-                            .find(|v| v.vout == vout.vout)
-                            .unwrap()
-                            .spending_input = spend.clone();
+                if should_query {
+                    spend = self.query.lookup_spend(&OutPoint {
+                        txid: txid.clone(),
+                        vout: vout.vout as u32,
+                    });
 
-                        let row = TweakTxRow::new(h, txid.clone(), &new_tweak);
-                        self.query.chain().store().tweak_db().put(
-                            &bincode::serialize_big(&row.key).unwrap(),
-                            &bincode::serialize_big(&row.value).unwrap(),
-                        );
-                    }
+                    has_been_spent = spend.is_some();
+                    let mut new_tweak = tweak.clone();
+                    new_tweak
+                        .vout_data
+                        .iter_mut()
+                        .find(|v| v.vout == vout.vout)
+                        .unwrap()
+                        .spending_input = spend.clone();
 
-                    let skip_this_vout = !historical_mode && has_been_spent;
-                    if skip_this_vout {
-                        continue;
-                    }
-
-                    if let Some(pubkey) = &vout
-                        .script_pubkey
-                        .to_asm()
-                        .split(" ")
-                        .collect::<Vec<&str>>()
-                        .last()
-                    {
-                        let mut items = json!([pubkey, vout.amount]);
-
-                        if historical_mode && has_been_spent {
-                            items
-                                .as_array_mut()
-                                .unwrap()
-                                .push(serde_json::to_value(&spend).unwrap());
-                        }
-
-                        vout_map.insert(vout.vout, items);
-                    }
+                    let row = TweakTxRow::new(row_height, txid.clone(), &new_tweak);
+                    self.query.chain().store().tweak_db().put(
+                        &bincode::serialize_big(&row.key).unwrap(),
+                        &bincode::serialize_big(&row.value).unwrap(),
+                    );
                 }
 
-                if vout_map.is_empty() {
+                let skip_this_vout = !historical_mode && has_been_spent;
+                if skip_this_vout {
                     continue;
                 }
 
+                if let Some(pubkey) = &vout
+                    .script_pubkey
+                    .to_asm()
+                    .split(" ")
+                    .collect::<Vec<&str>>()
+                    .last()
+                {
+                    let mut items = json!([pubkey, vout.amount]);
+
+                    if historical_mode && has_been_spent {
+                        items
+                            .as_array_mut()
+                            .unwrap()
+                            .push(serde_json::to_value(&spend).unwrap());
+                    }
+
+                    vout_map.insert(vout.vout, items);
+                }
+            }
+
+            if !vout_map.is_empty() {
                 tweak_map.insert(
                     txid.to_string(),
                     json!({
@@ -418,9 +450,18 @@ impl Connection {
                 );
             }
 
-            self.query.chain().store_tweak_cache_height(h, last_height);
+            if row_height != prev_height {
+                let _ = self.send_values(&[json!({"jsonrpc":"2.0","method":"blockchain.tweaks.subscribe","params":[{ prev_height.to_string(): tweak_map }]})]);
+                self.query
+                    .chain()
+                    .store_tweak_cache_height(row_height, last_height);
+                prev_height = row_height;
+                tweak_map = HashMap::new();
+            }
 
-            let _ = self.send_values(&[json!({"jsonrpc":"2.0","method":"blockchain.tweaks.subscribe","params":[{ h.to_string(): tweak_map }]})]);
+            if prev_height >= final_height.try_into().unwrap() {
+                break;
+            }
         }
 
         let done = json!({"jsonrpc":"2.0","method":"blockchain.tweaks.subscribe","params":[{"message": "done"}]});
@@ -560,7 +601,12 @@ impl Connection {
         let result = match method {
             "blockchain.block.header" => self.blockchain_block_header(&params),
             "blockchain.block.headers" => self.blockchain_block_headers(&params),
+            "blockchain.block.tweaks" => self.blockchain_block_tweaks(params),
             "blockchain.tweaks.subscribe" => self.tweaks_subscribe(params),
+            // "blockchain.tweaks.register" => self.tweaks_subscribe(params),
+            // "blockchain.tweaks.erase" => self.tweaks_subscribe(params),
+            // "blockchain.tweaks.get" => self.tweaks_subscribe(params),
+            // "blockchain.tweaks.scan" => self.tweaks_subscribe(params),
             "blockchain.estimatefee" => self.blockchain_estimatefee(&params),
             "blockchain.headers.subscribe" => self.blockchain_headers_subscribe(),
             "blockchain.relayfee" => self.blockchain_relayfee(),
@@ -951,7 +997,7 @@ impl RPC {
                     senders.lock().unwrap().push(sender.clone());
 
                     let spawned = spawn_thread("peer", move || {
-                        info!("[{}] connected peer", addr);
+                        debug!("[{}] connected peer", addr);
                         let conn = Connection::new(
                             query,
                             stream,
@@ -964,7 +1010,7 @@ impl RPC {
                             rpc_logging,
                         );
                         conn.run(receiver);
-                        info!("[{}] disconnected peer", addr);
+                        debug!("[{}] disconnected peer", addr);
                         let _ = garbage_sender.send(std::thread::current().id());
                     });
 

@@ -890,31 +890,18 @@ impl ChainQuery {
             .next()
     }
 
-    fn tweaks_iter_scan(&self, code: u8, height: u32) -> ScanIterator {
-        self.store.tweak_db.iter_scan_from(
-            &TweakTxRow::filter(code),
-            &TweakTxRow::prefix_blockheight(code, height),
+    pub fn tweaks_iter_scan_reverse(&self, height: u32) -> ReverseScanIterator {
+        self.store.tweak_db.iter_scan_reverse(
+            &TweakTxRow::filter(),
+            &TweakTxRow::prefix_blockheight(TweakTxRow::code(), height),
         )
     }
 
-    pub fn tweaks(&self, height: u32) -> Vec<(Txid, TweakData)> {
-        self._tweaks(b'K', height)
-    }
-
-    fn _tweaks(&self, code: u8, height: u32) -> Vec<(Txid, TweakData)> {
-        let _timer = self.start_timer("tweaks");
-        self.tweaks_iter_scan(code, height)
-            .filter_map(|row| {
-                let tweak_row = TweakTxRow::from_row(row);
-                if height != tweak_row.key.blockheight {
-                    return None;
-                }
-
-                let txid = tweak_row.key.txid;
-                let tweak = tweak_row.get_tweak_data();
-                Some((txid, tweak))
-            })
-            .collect()
+    pub fn tweaks_iter_scan(&self, height: u32) -> ScanIterator {
+        self.store.tweak_db.iter_scan_from(
+            &TweakTxRow::filter(),
+            &TweakTxRow::prefix_blockheight(TweakTxRow::code(), height),
+        )
     }
 
     // TODO: avoid duplication with stats/stats_delta?
@@ -1162,13 +1149,20 @@ impl ChainQuery {
             .cloned()
     }
 
-    pub fn get_block_tweaks(&self, hash: &BlockHash) -> Option<Vec<Vec<u8>>> {
+    pub fn get_block_tweaks(&self, hash: &BlockHash) -> Vec<String> {
         let _timer = self.start_timer("get_block_tweaks");
 
-        self.store
+        let tweaks: Vec<Vec<u8>> = self
+            .store
             .tweak_db
             .get(&BlockRow::tweaks_key(full_hash(&hash[..])))
             .map(|val| bincode::deserialize_little(&val).expect("failed to parse block tweaks"))
+            .unwrap();
+
+        tweaks
+            .into_iter()
+            .map(|tweak| tweak.to_lower_hex_string())
+            .collect()
     }
 
     pub fn hash_by_height(&self, height: usize) -> Option<BlockHash> {
@@ -1460,13 +1454,24 @@ struct TweakBlockRecordCacheRow {
 impl TweakBlockRecordCacheRow {
     pub fn new(height: u32, tip: u32) -> TweakBlockRecordCacheRow {
         TweakBlockRecordCacheRow {
-            key: TweakBlockRecordCacheKey { code: b'B', height },
+            key: TweakBlockRecordCacheKey {
+                code: TweakBlockRecordCacheRow::code(),
+                height,
+            },
             value: tip,
         }
     }
 
+    pub fn code() -> u8 {
+        b'B'
+    }
+
     pub fn key(height: u32) -> Bytes {
-        bincode::serialize_big(&TweakBlockRecordCacheKey { code: b'B', height }).unwrap()
+        bincode::serialize_big(&TweakBlockRecordCacheKey {
+            code: TweakBlockRecordCacheRow::code(),
+            height,
+        })
+        .unwrap()
     }
 
     pub fn from_row(row: DBRow) -> TweakBlockRecordCacheRow {
@@ -1501,8 +1506,8 @@ pub struct TweakData {
 #[derive(Serialize, Deserialize)]
 pub struct TweakTxKey {
     code: u8,
-    blockheight: u32,
-    txid: Txid,
+    pub blockheight: u32,
+    pub txid: Txid,
 }
 
 pub struct TweakTxRow {
@@ -1514,7 +1519,7 @@ impl TweakTxRow {
     pub fn new(blockheight: u32, txid: Txid, tweak: &TweakData) -> TweakTxRow {
         TweakTxRow {
             key: TweakTxKey {
-                code: b'K',
+                code: TweakTxRow::code(),
                 blockheight,
                 txid,
             },
@@ -1530,14 +1535,18 @@ impl TweakTxRow {
         }
     }
 
-    fn from_row(row: DBRow) -> TweakTxRow {
+    pub fn from_row(row: DBRow) -> TweakTxRow {
         let key: TweakTxKey = bincode::deserialize_big(&row.key).unwrap();
         let value: TweakData = bincode::deserialize_big(&row.value).unwrap();
         TweakTxRow { key, value }
     }
 
-    fn filter(code: u8) -> Bytes {
-        [code].to_vec()
+    pub fn code() -> u8 {
+        b'K'
+    }
+
+    fn filter() -> Bytes {
+        [TweakTxRow::code()].to_vec()
     }
 
     fn prefix_blockheight(code: u8, height: u32) -> Bytes {
@@ -1725,9 +1734,16 @@ impl BlockRow {
         }
     }
 
+    pub fn tweaks_code() -> u8 {
+        b'W'
+    }
+
     fn new_tweaks(hash: FullHash, tweaks: &[Vec<u8>]) -> BlockRow {
         BlockRow {
-            key: BlockKey { code: b'W', hash },
+            key: BlockKey {
+                code: BlockRow::tweaks_code(),
+                hash,
+            },
             value: bincode::serialize_little(tweaks).unwrap(),
         }
     }
@@ -1752,7 +1768,7 @@ impl BlockRow {
     }
 
     fn tweaks_key(hash: FullHash) -> Bytes {
-        [b"W", &hash[..]].concat()
+        [&[BlockRow::tweaks_code()], &hash[..]].concat()
     }
 
     fn done_filter() -> Bytes {

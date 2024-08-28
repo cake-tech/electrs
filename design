@@ -1,0 +1,4 @@
+regiser -> create DB R -> add
+erase -> check DB R exists -> delete from DB R
+scan -> tweaks subscribe -> but instead of sending data, scans
+get -> get all stored scanned scripthashes, good for ex when restoring wallet.

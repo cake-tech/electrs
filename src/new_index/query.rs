@@ -18,7 +18,8 @@ use crate::{
     elements::{lookup_asset, AssetRegistry, AssetSorting, LiquidAsset},
 };
 
-use super::schema::{TweakData, MIN_SP_TWEAK_HEIGHT};
+use super::db::{ReverseScanIterator, ScanIterator};
+use super::schema::MIN_SP_TWEAK_HEIGHT;
 
 const FEE_ESTIMATES_TTL: u64 = 60; // seconds
 
@@ -111,8 +112,17 @@ impl Query {
         confirmed_txids.chain(mempool_txids).collect()
     }
 
-    pub fn tweaks(&self, height: u32) -> Vec<(Txid, TweakData)> {
-        self.chain.tweaks(height)
+    pub fn block_tweaks(&self, height: u32) -> Vec<String> {
+        self.chain
+            .get_block_tweaks(&self.chain.hash_by_height(height as usize).unwrap())
+    }
+
+    pub fn tweaks_iter_scan_reverse(&self, height: u32) -> ReverseScanIterator {
+        self.chain.tweaks_iter_scan_reverse(height)
+    }
+
+    pub fn tweaks_iter_scan(&self, height: u32) -> ScanIterator {
+        self.chain.tweaks_iter_scan(height)
     }
 
     pub fn stats(&self, scripthash: &[u8]) -> (ScriptStats, ScriptStats) {
