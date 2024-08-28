@@ -1,85 +1,72 @@
-# Esplora - Electrs backend API
+![Logo](logo/logo.svg)
 
-A block chain index engine and HTTP API written in Rust based on [romanz/electrs](https://github.com/romanz/electrs).
+# Electrum Server in Rust
+
+[![CI](https://github.com/romanz/electrs/actions/workflows/rust.yml/badge.svg)](https://github.com/romanz/electrs/actions)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](http://makeapullrequest.com)
+[![crates.io](https://img.shields.io/crates/v/electrs.svg)](https://crates.io/crates/electrs)
+[![gitter.im](https://badges.gitter.im/romanz/electrs.svg)](https://gitter.im/romanz/electrs)
 
 Used as the backend for the [Esplora block explorer](https://github.com/Blockstream/esplora) powering [blockstream.info](https://blockstream.info/).
 
-API documentation [is available here](https://github.com/blockstream/esplora/blob/master/API.md).
+The motivation behind this project is to enable a user to self host an Electrum server,
+with required hardware resources not much beyond those of a [full node](https://en.bitcoin.it/wiki/Full_node#Why_should_you_use_a_full_node_wallet).
+The server indexes the entire Bitcoin blockchain, and the resulting index enables fast queries for any given user wallet,
+allowing the user to keep real-time track of balances and transaction history using the [Electrum wallet](https://electrum.org/).
+Since it runs on the user's own machine, there is no need for the wallet to communicate with external Electrum servers,
+thus preserving the privacy of the user's addresses and balances.
 
-Documentation for the database schema and indexing process [is available here](doc/schema.md).
 
-### Installing & indexing
+## Usage
 
-Install Rust, Bitcoin Core (no `txindex` needed) and the `clang` and `cmake` packages, then:
+**Please prefer to use OUR usage guide!**
 
-```bash
-$ git clone https://github.com/blockstream/electrs && cd electrs
-$ git checkout new-index
-$ cargo run --release --bin electrs -- -vvvv --daemon-dir ~/.bitcoin
+External guides can be out-of-date and have various problems.
+At least double-check that the guide you're using is actively maintained.
+If you can't use our guide, please ask about what you don't understand or consider using automated deployments.
+
+Note that this implementation of Electrum server is optimized for **personal/small-scale (family/friends) usage**.
+It's a bad idea to run it publicly as it'd expose you to DoS and maybe also other attacks.
+If you want to run a public server you may be interested in the [Blockstream fork of electrs](https://github.com/Blockstream/electrs)
+which is better optimized for public usage at the cost of consuming *significantly* more resources.
+
+ * [Installation from source](doc/install.md)
+ * [Pre-built binaries](doc/binaries.md) (No official binaries available but a beta repository is available for installation)
+ * [Configuration](doc/config.md)
+ * [Usage](doc/usage.md)
+ * [Monitoring](doc/monitoring.md)
+ * [Upgrading](doc/upgrading.md) - **contains information about important changes from older versions**
+
+## Features
+
+ * Supports Electrum protocol [v1.4](https://electrumx-spesmilo.readthedocs.io/en/latest/protocol.html)
+ * Maintains an index over transaction inputs and outputs, allowing fast balance queries
+ * Fast synchronization of the Bitcoin blockchain (~6.5 hours for ~504GB @ August 2023) using HDD storage.
+ * Low index storage overhead (~10%), relying on a local full node for transaction retrieval
+ * Efficient mempool tracker (allowing better fee [estimation](https://github.com/spesmilo/electrum/blob/59c1d03f018026ac301c4e74facfc64da8ae4708/RELEASE-NOTES#L34-L46))
+ * Low CPU & memory usage (after initial indexing)
+ * [`txindex`](https://github.com/bitcoinbook/bitcoinbook/blob/develop/ch03.asciidoc#txindex) is not required for the Bitcoin node
+ * Uses a single [RocksDB](https://github.com/spacejam/rust-rocksdb) database, for better consistency and crash recovery
+
+## Altcoins
+
+Altcoins are **not supported**!
+Forks of Bitcoin codebase that relax the consensus rules (hard forks) are also **not supported**.
+
+You may be able to find a fork of electrs that does support them, look around or make your own, just don't file issues/PRs here.
 
 # Or for liquid:
 $ cargo run --features liquid --release --bin electrs -- -vvvv --network liquid --daemon-dir ~/.liquid
 ```
 
-See [electrs's original documentation](https://github.com/romanz/electrs/blob/master/doc/usage.md) for more detailed instructions.
-Note that our indexes are incompatible with electrs's and has to be created separately.
+The database schema is described [here](doc/schema.md).
 
-The indexes require 610GB of storage after running compaction (as of June 2020), but you'll need to have
-free space of about double that available during the index compaction process.
-Creating the indexes should take a few hours on a beefy machine with SSD.
+## Contributing
 
-To deploy with Docker, follow the [instructions here](https://github.com/Blockstream/esplora#how-to-build-the-docker-image).
+All contributions to this project are welcome. Please refer to the [Contributing Guidelines](CONTRIBUTING.md) for more details.
 
-### Light mode
+## Logo
 
-For personal or low-volume use, you may set `--lightmode` to reduce disk storage requirements
-by roughly 50% at the cost of slower and more expensive lookups.
-
-With this option set, raw transactions and metadata associated with blocks will not be kept in rocksdb
-(the `T`, `X` and `M` indexes),
-but instead queried from bitcoind on demand.
-
-### Notable changes from Electrs:
-
-- HTTP REST API in addition to the Electrum JSON-RPC protocol, with extended transaction information
-  (previous outputs, spending transactions, script asm and more).
-
-- Extended indexes and database storage for improved performance under high load:
-
-  - A full transaction store mapping txids to raw transactions is kept in the database under the prefix `t`.
-  - An index of all spendable transaction outputs is kept under the prefix `O`.
-  - An index of all addresses (encoded as string) is kept under the prefix `a` to enable by-prefix address search.
-  - A map of blockhash to txids is kept in the database under the prefix `X`.
-  - Block stats metadata (number of transactions, size and weight) is kept in the database under the prefix `M`.
-
-  With these new indexes, bitcoind is no longer queried to serve user requests and is only polled
-  periodically for new blocks and for syncing the mempool.
-
-- Support for Liquid and other Elements-based networks, including CT, peg-in/out and multi-asset.
-  (requires enabling the `liquid` feature flag using `--features liquid`)
-
-### CLI options
-
-In addition to electrs's original configuration options, a few new options are also available:
-
-- `--http-addr <addr:port>` - HTTP server address/port to listen on (default: `127.0.0.1:3000`).
-- `--lightmode` - enable light mode (see above)
-- `--cors <origins>` - origins allowed to make cross-site request (optional, defaults to none).
-- `--address-search` - enables the by-prefix address search index.
-- `--index-unspendables` - enables indexing of provably unspendable outputs.
-- `--utxos-limit <num>` - maximum number of utxos to return per address.
-- `--electrum-txs-limit <num>` - maximum number of txs to return per address in the electrum server (does not apply for the http api).
-- `--electrum-banner <text>` - welcome banner text for electrum server.
-
-Additional options with the `liquid` feature:
-- `--parent-network <network>` - the parent network this chain is pegged to.
-
-Additional options with the `electrum-discovery` feature:
-- `--electrum-hosts <json>` - a json map of the public hosts where the electrum server is reachable, in the [`server.features` format](https://electrumx.readthedocs.io/en/latest/protocol-methods.html#server.features).
-- `--electrum-announce` - announce the electrum server on the electrum p2p server discovery network.
-
-See `$ cargo run --release --bin electrs -- --help` for the full list of options.
-
-## License
-
-MIT
+[Our logo](logo/) is generously provided by [Dominik Průša](https://github.com/DominoPrusa) under the MIT license.
+Based on the [Electrum logo](https://github.com/spesmilo/electrum/blob/master/LICENCE)
+and the [Rust language logo](https://www.rust-lang.org/policies/media-guide).

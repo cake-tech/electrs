@@ -1,53 +1,54 @@
-name: CI
+name: electrs
 
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 0 * * *" # once a day
 
 jobs:
-  test:
-    runs-on: ubuntu-20.04
-    env:
-      CARGO_TERM_COLOR: always
+  build:
+    name: Build
 
-    steps:
-    - uses: actions/checkout@v2
-
-    - name: Cache cargo registry
-      uses: actions/cache@v1
-      with:
-        path: ~/.cargo/registry
-        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-    - name: Cache cargo index
-      uses: actions/cache@v1
-      with:
-        path: ~/.cargo/git
-        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-
-    - name: Cache cargo build
-      uses: actions/cache@v1
-      with:
-        path: target
-        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-
-    #- name: Check formatting
-    #  run: cargo fmt -- --check
-
-    - name: Setup Rust toolchain
-      run: rustup default 1.75.0
-
-    - name: Check for errors
-      run: cargo check
-
-    - name: Tests (Bitcoin mode, REST+Electrum)
-      run: cargo test
-
-    - name: Tests (Liquid mode, REST)
-      run: cargo test --features liquid
-
-  nix:
     runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        build-args:
+          [
+            --locked --no-default-features,
+            --locked,
+            --locked --features metrics_process,
+          ]
+
     steps:
       - uses: actions/checkout@v3
-      - uses: DeterminateSystems/nix-installer-action@main
-      - run: nix build .
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
+      - name: Install Rust
+        run: rustup component add rustfmt clippy
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Build
+        run: cargo build ${{ matrix.build-args }} --all
+
+      - name: Test
+        run: cargo test  ${{ matrix.build-args }} --all
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+
+  integration:
+    name: Integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Build
+        run: docker build -f Dockerfile.ci . --rm -t electrs:tests
+      - name: Test
+        run: docker run -v $PWD/contrib/:/contrib -v $PWD/tests/:/tests --rm electrs:tests bash /tests/run.sh

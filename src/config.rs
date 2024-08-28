@@ -1,432 +1,356 @@
-use clap::{App, Arg};
-use dirs::home_dir;
-use std::fs;
+use bitcoin::p2p::Magic;
+use bitcoin::Network;
+use bitcoincore_rpc::Auth;
+use dirs_next::home_dir;
+
+use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use stderrlog;
+use std::path::PathBuf;
+use std::str::FromStr;
 
-use crate::chain::Network;
-use crate::daemon::CookieGetter;
-use crate::errors::*;
+use std::env::consts::{ARCH, OS};
+use std::time::Duration;
 
-#[cfg(feature = "liquid")]
-use bitcoin::Network as BNetwork;
+pub const ELECTRS_VERSION: &str = env!("CARGO_PKG_VERSION");
+const DEFAULT_SERVER_ADDRESS: [u8; 4] = [127, 0, 0, 1]; // by default, serve on IPv4 localhost
 
-const ELECTRS_VERSION: &str = env!("CARGO_PKG_VERSION");
+mod internal {
+    #![allow(clippy::enum_variant_names)]
+    #![allow(clippy::unnecessary_lazy_evaluations)]
+    #![allow(clippy::useless_conversion)]
 
-#[derive(Debug, Clone)]
+    include!(concat!(env!("OUT_DIR"), "/configure_me_config.rs"));
+}
+
+/// A simple error type representing invalid UTF-8 input.
+pub struct InvalidUtf8(OsString);
+
+impl fmt::Display for InvalidUtf8 {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?} isn't a valid UTF-8 sequence", self.0)
+    }
+}
+
+/// An error that might happen when resolving an address
+pub enum AddressError {
+    ResolvError { addr: String, err: std::io::Error },
+    NoAddrError(String),
+}
+
+impl fmt::Display for AddressError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            AddressError::ResolvError { addr, err } => {
+                write!(f, "Failed to resolve address {}: {}", addr, err)
+            }
+            AddressError::NoAddrError(addr) => write!(f, "No address found for {}", addr),
+        }
+    }
+}
+
+/// Newtype for an address that is parsed as `String`
+///
+/// The main point of this newtype is to provide better description than what `String` type
+/// provides.
+#[derive(Deserialize)]
+pub struct ResolvAddr(String);
+
+impl ::configure_me::parse_arg::ParseArg for ResolvAddr {
+    type Error = InvalidUtf8;
+
+    fn parse_arg(arg: &OsStr) -> std::result::Result<Self, Self::Error> {
+        Self::parse_owned_arg(arg.to_owned())
+    }
+
+    fn parse_owned_arg(arg: OsString) -> std::result::Result<Self, Self::Error> {
+        arg.into_string().map_err(InvalidUtf8).map(ResolvAddr)
+    }
+
+    fn describe_type<W: fmt::Write>(mut writer: W) -> fmt::Result {
+        write!(writer, "a network address (will be resolved if needed)")
+    }
+}
+
+impl ResolvAddr {
+    /// Resolves the address.
+    fn resolve(self) -> std::result::Result<SocketAddr, AddressError> {
+        match self.0.to_socket_addrs() {
+            Ok(mut iter) => iter.next().ok_or(AddressError::NoAddrError(self.0)),
+            Err(err) => Err(AddressError::ResolvError { addr: self.0, err }),
+        }
+    }
+
+    /// Resolves the address, but prints error and exits in case of failure.
+    fn resolve_or_exit(self) -> SocketAddr {
+        self.resolve().unwrap_or_else(|err| {
+            eprintln!("Error: {}", err);
+            std::process::exit(1)
+        })
+    }
+}
+
+/// This newtype implements `ParseArg` for `Network`.
+#[derive(Deserialize)]
+pub struct BitcoinNetwork(Network);
+
+impl Default for BitcoinNetwork {
+    fn default() -> Self {
+        BitcoinNetwork(Network::Bitcoin)
+    }
+}
+
+impl FromStr for BitcoinNetwork {
+    type Err = <Network as FromStr>::Err;
+
+    fn from_str(string: &str) -> std::result::Result<Self, Self::Err> {
+        Network::from_str(string).map(BitcoinNetwork)
+    }
+}
+
+impl ::configure_me::parse_arg::ParseArgFromStr for BitcoinNetwork {
+    fn describe_type<W: fmt::Write>(mut writer: W) -> fmt::Result {
+        write!(writer, "either 'bitcoin', 'testnet', 'regtest' or 'signet'")
+    }
+}
+
+impl From<BitcoinNetwork> for Network {
+    fn from(network: BitcoinNetwork) -> Network {
+        network.0
+    }
+}
+
+/// Parsed and post-processed configuration
+#[derive(Debug)]
 pub struct Config {
     // See below for the documentation of each field:
-    pub log: stderrlog::StdErrLog,
-    pub network_type: Network,
+    pub network: Network,
     pub db_path: PathBuf,
+    pub db_log_dir: Option<PathBuf>,
     pub daemon_dir: PathBuf,
-    pub blocks_dir: PathBuf,
+    pub daemon_auth: SensitiveAuth,
     pub daemon_rpc_addr: SocketAddr,
-    pub cookie: Option<String>,
+    pub daemon_p2p_addr: SocketAddr,
     pub electrum_rpc_addr: SocketAddr,
     pub http_addr: SocketAddr,
     pub http_socket_file: Option<PathBuf>,
     pub monitoring_addr: SocketAddr,
-    pub jsonrpc_import: bool,
-    pub light_mode: bool,
-    pub address_search: bool,
-    pub index_unspendables: bool,
-    pub cors: Option<String>,
-    pub precache_scripts: Option<String>,
-    pub utxos_limit: usize,
-    pub electrum_txs_limit: usize,
-    pub electrum_banner: String,
-    pub electrum_rpc_logging: Option<RpcLogging>,
-
-    #[cfg(feature = "liquid")]
-    pub parent_network: BNetwork,
-    #[cfg(feature = "liquid")]
-    pub asset_db_path: Option<PathBuf>,
-
-    #[cfg(feature = "electrum-discovery")]
-    pub electrum_public_hosts: Option<crate::electrum::ServerHosts>,
-    #[cfg(feature = "electrum-discovery")]
-    pub electrum_announce: bool,
-    #[cfg(feature = "electrum-discovery")]
-    pub tor_proxy: Option<std::net::SocketAddr>,
+    pub wait_duration: Duration,
+    pub jsonrpc_timeout: Duration,
+    pub index_batch_size: usize,
+    pub index_lookup_limit: Option<usize>,
+    pub reindex_last_blocks: usize,
+    pub auto_reindex: bool,
+    pub ignore_mempool: bool,
+    pub sync_once: bool,
+    pub skip_block_download_wait: bool,
+    pub disable_electrum_rpc: bool,
+    pub server_banner: String,
+    pub signet_magic: Magic,
     pub sp_begin_height: Option<usize>,
     pub sp_min_dust: Option<usize>,
-    pub sp_check_spends: bool,
-    pub skip_history: bool,
-    pub skip_tweaks: bool,
-    pub skip_mempool: bool,
+    pub sp_skip_height: Option<usize>,
+    pub args: Vec<String>,
 }
 
-fn str_to_socketaddr(address: &str, what: &str) -> SocketAddr {
-    address
-        .to_socket_addrs()
-        .unwrap_or_else(|_| panic!("unable to resolve {} address", what))
-        .collect::<Vec<_>>()
-        .pop()
-        .unwrap()
+pub struct SensitiveAuth(pub Auth);
+
+impl SensitiveAuth {
+    pub(crate) fn get_auth(&self) -> Auth {
+        self.0.clone()
+    }
+}
+
+impl fmt::Debug for SensitiveAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Auth::UserPass(ref user, _) => f
+                .debug_tuple("UserPass")
+                .field(&user)
+                .field(&"<sensitive>")
+                .finish(),
+            _ => write!(f, "{:?}", self.0),
+        }
+    }
+}
+
+/// Returns default daemon directory
+fn default_daemon_dir() -> PathBuf {
+    let mut home = home_dir().unwrap_or_else(|| {
+        eprintln!("Error: unknown home directory");
+        std::process::exit(1)
+    });
+    home.push(".bitcoin");
+    home
+}
+
+fn default_config_files() -> Vec<OsString> {
+    let mut files = vec![OsString::from("electrs.toml")]; // cwd
+    if let Some(mut path) = home_dir() {
+        path.extend(&[".electrs", "config.toml"]);
+        files.push(OsString::from(path)) // home directory
+    }
+    files.push(OsString::from("/etc/electrs/config.toml")); // system-wide
+    files
 }
 
 impl Config {
+    /// Parses args, env vars, config files and post-processes them
     pub fn from_args() -> Config {
-        let network_help = format!("Select network type ({})", Network::names().join(", "));
-        let rpc_logging_help = format!(
-            "Select RPC logging option ({})",
-            RpcLogging::options().join(", ")
-        );
+        use internal::ResultExt;
 
-        let args = App::new("Electrum Rust Server")
-            .version(crate_version!())
-            .arg(
-                Arg::with_name("verbosity")
-                    .short("v")
-                    .multiple(true)
-                    .help("Increase logging verbosity"),
-            )
-            .arg(
-                Arg::with_name("timestamp")
-                    .long("timestamp")
-                    .help("Prepend log lines with a timestamp"),
-            )
-            .arg(
-                Arg::with_name("db_dir")
-                    .long("db-dir")
-                    .help("Directory to store index database (default: ./db/)")
-                    .takes_value(true),
-            )
-            .arg(
-                Arg::with_name("daemon_dir")
-                    .long("daemon-dir")
-                    .help("Data directory of Bitcoind (default: ~/.bitcoin/)")
-                    .takes_value(true),
-            )
-            .arg(
-                Arg::with_name("blocks_dir")
-                    .long("blocks-dir")
-                    .help("Analogous to bitcoind's -blocksdir option, this specifies the directory containing the raw blocks files (blk*.dat) (default: ~/.bitcoin/blocks/)")
-                    .takes_value(true),
-            )
-            .arg(
-                Arg::with_name("cookie")
-                    .long("cookie")
-                    .help("JSONRPC authentication cookie ('USER:PASSWORD', default: read from ~/.bitcoin/.cookie)")
-                    .takes_value(true),
-            )
-            .arg(
-                Arg::with_name("network")
-                    .long("network")
-                    .help(&network_help)
-                    .takes_value(true),
-            )
-            .arg(
-                Arg::with_name("electrum_rpc_addr")
-                    .long("electrum-rpc-addr")
-                    .help("Electrum server JSONRPC 'addr:port' to listen on (default: '127.0.0.1:50001' for mainnet, '127.0.0.1:60001' for testnet and '127.0.0.1:60401' for regtest)")
-                    .takes_value(true),
-            )
-            .arg(
-                Arg::with_name("http_addr")
-                    .long("http-addr")
-                    .help("HTTP server 'addr:port' to listen on (default: '127.0.0.1:3000' for mainnet, '127.0.0.1:3001' for testnet and '127.0.0.1:3002' for regtest)")
-                    .takes_value(true),
-            )
-            .arg(
-                Arg::with_name("daemon_rpc_addr")
-                    .long("daemon-rpc-addr")
-                    .help("Bitcoin daemon JSONRPC 'addr:port' to connect (default: 127.0.0.1:8332 for mainnet, 127.0.0.1:18332 for testnet and 127.0.0.1:18443 for regtest)")
-                    .takes_value(true),
-            )
-            .arg(
-                Arg::with_name("monitoring_addr")
-                    .long("monitoring-addr")
-                    .help("Prometheus monitoring 'addr:port' to listen on (default: 127.0.0.1:4224 for mainnet, 127.0.0.1:14224 for testnet and 127.0.0.1:24224 for regtest)")
-                    .takes_value(true),
-            )
-            .arg(
-                Arg::with_name("jsonrpc_import")
-                    .long("jsonrpc-import")
-                    .help("Use JSONRPC instead of directly importing blk*.dat files. Useful for remote full node or low memory system"),
-            )
-            .arg(
-                Arg::with_name("light_mode")
-                    .long("lightmode")
-                    .help("Enable light mode for reduced storage")
-            )
-            .arg(
-                Arg::with_name("address_search")
-                    .long("address-search")
-                    .help("Enable prefix address search")
-            )
-            .arg(
-                Arg::with_name("index_unspendables")
-                    .long("index-unspendables")
-                    .help("Enable indexing of provably unspendable outputs")
-            )
-            .arg(
-                Arg::with_name("cors")
-                    .long("cors")
-                    .help("Origins allowed to make cross-site requests")
-                    .takes_value(true)
-            )
-            .arg(
-                Arg::with_name("precache_scripts")
-                    .long("precache-scripts")
-                    .help("Path to file with list of scripts to pre-cache")
-                    .takes_value(true)
-            )
-            .arg(
-                Arg::with_name("utxos_limit")
-                    .long("utxos-limit")
-                    .help("Maximum number of utxos to process per address. Lookups for addresses with more utxos will fail. Applies to the Electrum and HTTP APIs.")
-                    .default_value("500")
-            )
-            .arg(
-                Arg::with_name("electrum_txs_limit")
-                    .long("electrum-txs-limit")
-                    .help("Maximum number of transactions returned by Electrum history queries. Lookups with more results will fail.")
-                    .default_value("500")
-            ).arg(
-                Arg::with_name("electrum_banner")
-                    .long("electrum-banner")
-                    .help("Welcome banner for the Electrum server, shown in the console to clients.")
-                    .takes_value(true)
-            ).arg(
-                Arg::with_name("electrum_rpc_logging")
-                    .long("electrum-rpc-logging")
-                    .help(&rpc_logging_help)
-                    .takes_value(true),
-            ).arg(
-            Arg::with_name("skip_history")
-                .long("skip-history")
-                .help("Skip history indexing"),
-        ).arg(
-                Arg::with_name("skip_mempool")
-                    .long("skip-mempool")
-                    .help("Skip local mempool"),
-            );
+        let (mut config, args) =
+            internal::Config::including_optional_config_files(default_config_files())
+                .unwrap_or_exit();
 
-        #[cfg(unix)]
-        let args = args.arg(
-                Arg::with_name("http_socket_file")
-                    .long("http-socket-file")
-                    .help("HTTP server 'unix socket file' to listen on (default disabled, enabling this disables the http server)")
-                    .takes_value(true),
-            );
+        fn unsupported_network(network: Network) -> ! {
+            eprintln!("Error: unsupported network: {}", network);
+            std::process::exit(1);
+        }
 
-        #[cfg(feature = "liquid")]
-        let args = args
-            .arg(
-                Arg::with_name("parent_network")
-                    .long("parent-network")
-                    .help("Select parent network type (mainnet, testnet, regtest)")
-                    .takes_value(true),
-            )
-            .arg(
-                Arg::with_name("asset_db_path")
-                    .long("asset-db-path")
-                    .help("Directory for liquid/elements asset db")
-                    .takes_value(true),
-            );
+        let db_subdir = match config.network {
+            Network::Bitcoin => "bitcoin",
+            Network::Testnet => "testnet",
+            Network::Regtest => "regtest",
+            Network::Signet => "signet",
+            unsupported => unsupported_network(unsupported),
+        };
 
-        #[cfg(feature = "electrum-discovery")]
-        let args = args.arg(
-                Arg::with_name("electrum_public_hosts")
-                    .long("electrum-public-hosts")
-                    .help("A dictionary of hosts where the Electrum server can be reached at. Required to enable server discovery. See https://electrumx.readthedocs.io/en/latest/protocol-methods.html#server-features")
-                    .takes_value(true)
-            ).arg(
-                Arg::with_name("electrum_announce")
-                    .long("electrum-announce")
-                    .help("Announce the Electrum server to other servers")
-            ).arg(
-            Arg::with_name("tor_proxy")
-                .long("tor-proxy")
-                .help("ip:addr of socks proxy for accessing onion hosts")
-                .takes_value(true),
-        );
+        config.db_dir.push(db_subdir);
 
-        #[cfg(feature = "silent-payments")]
-        let args = args
-            .arg(
-                Arg::with_name("sp_begin_height")
-                    .long("sp-begin-height")
-                    .help("Block height at which to begin scanning for silent payments")
-                    .takes_value(true),
-            )
-            .arg(
-                Arg::with_name("sp_min_dust")
-                    .long("sp-min-dust")
-                    .help("Minimum dust value for silent payments")
-                    .takes_value(true),
-            )
-            .arg(
-                Arg::with_name("sp_check_spends")
-                    .long("sp-check-spends")
-                    .help("Check spends of silent payments"),
-            )
-            .arg(
-                Arg::with_name("skip_tweaks")
-                    .long("skip-tweaks")
-                    .help("Skip tweaks indexing"),
-            );
-
-        let m = args.get_matches();
-
-        let network_name = m.value_of("network").unwrap_or("mainnet");
-        let network_type = Network::from(network_name);
-        let db_dir = Path::new(m.value_of("db_dir").unwrap_or("./db"));
-        let db_path = db_dir.join(network_name);
-
-        #[cfg(feature = "liquid")]
-        let parent_network = m
-            .value_of("parent_network")
-            .map(|s| s.parse().expect("invalid parent network"))
-            .unwrap_or_else(|| match network_type {
-                Network::Liquid => BNetwork::Bitcoin,
-                // XXX liquid testnet/regtest don't have a parent chain
-                Network::LiquidTestnet | Network::LiquidRegtest => BNetwork::Regtest,
-            });
-
-        #[cfg(feature = "liquid")]
-        let asset_db_path = m.value_of("asset_db_path").map(PathBuf::from);
-
-        let default_daemon_port = match network_type {
-            #[cfg(not(feature = "liquid"))]
+        let default_daemon_rpc_port = match config.network {
             Network::Bitcoin => 8332,
             #[cfg(not(feature = "liquid"))]
             Network::Testnet => 18332,
             #[cfg(not(feature = "liquid"))]
             Network::Regtest => 18443,
-            #[cfg(not(feature = "liquid"))]
             Network::Signet => 38332,
-
-            #[cfg(feature = "liquid")]
-            Network::Liquid => 7041,
-            #[cfg(feature = "liquid")]
-            Network::LiquidTestnet | Network::LiquidRegtest => 7040,
+            unsupported => unsupported_network(unsupported),
         };
-        let default_electrum_port = match network_type {
-            #[cfg(not(feature = "liquid"))]
+        let default_daemon_p2p_port = match config.network {
+            Network::Bitcoin => 8333,
+            Network::Testnet => 18333,
+            Network::Regtest => 18444,
+            Network::Signet => 38333,
+            unsupported => unsupported_network(unsupported),
+        };
+        let default_electrum_port = match config.network {
             Network::Bitcoin => 50001,
             #[cfg(not(feature = "liquid"))]
             Network::Testnet => 60001,
             #[cfg(not(feature = "liquid"))]
             Network::Regtest => 60401,
-            #[cfg(not(feature = "liquid"))]
             Network::Signet => 60601,
-
-            #[cfg(feature = "liquid")]
-            Network::Liquid => 51000,
-            #[cfg(feature = "liquid")]
-            Network::LiquidTestnet => 51301,
-            #[cfg(feature = "liquid")]
-            Network::LiquidRegtest => 51401,
+            unsupported => unsupported_network(unsupported),
         };
-        let default_http_port = match network_type {
-            #[cfg(not(feature = "liquid"))]
-            Network::Bitcoin => 3000,
-            #[cfg(not(feature = "liquid"))]
-            Network::Testnet => 3001,
-            #[cfg(not(feature = "liquid"))]
-            Network::Regtest => 3002,
-            #[cfg(not(feature = "liquid"))]
-            Network::Signet => 3003,
-
-            #[cfg(feature = "liquid")]
-            Network::Liquid => 3000,
-            #[cfg(feature = "liquid")]
-            Network::LiquidTestnet => 3001,
-            #[cfg(feature = "liquid")]
-            Network::LiquidRegtest => 3002,
-        };
-        let default_monitoring_port = match network_type {
-            #[cfg(not(feature = "liquid"))]
+        let default_monitoring_port = match config.network {
             Network::Bitcoin => 4224,
             #[cfg(not(feature = "liquid"))]
             Network::Testnet => 14224,
             #[cfg(not(feature = "liquid"))]
             Network::Regtest => 24224,
-            #[cfg(not(feature = "liquid"))]
-            Network::Signet => 54224,
-
-            #[cfg(feature = "liquid")]
-            Network::Liquid => 34224,
-            #[cfg(feature = "liquid")]
-            Network::LiquidTestnet => 44324,
-            #[cfg(feature = "liquid")]
-            Network::LiquidRegtest => 44224,
+            Network::Signet => 34224,
+            unsupported => unsupported_network(unsupported),
         };
 
-        let daemon_rpc_addr: SocketAddr = str_to_socketaddr(
-            m.value_of("daemon_rpc_addr")
-                .unwrap_or(&format!("127.0.0.1:{}", default_daemon_port)),
-            "Bitcoin RPC",
-        );
-        let electrum_rpc_addr: SocketAddr = str_to_socketaddr(
-            m.value_of("electrum_rpc_addr")
-                .unwrap_or(&format!("127.0.0.1:{}", default_electrum_port)),
-            "Electrum RPC",
-        );
-        let http_addr: SocketAddr = str_to_socketaddr(
-            m.value_of("http_addr")
-                .unwrap_or(&format!("127.0.0.1:{}", default_http_port)),
-            "HTTP Server",
-        );
+        let magic = match (config.network, config.signet_magic) {
+            (Network::Signet, Some(magic)) => magic.parse().unwrap_or_else(|error| {
+                eprintln!(
+                    "Error: signet magic '{}' is not a valid hex string: {}",
+                    magic, error
+                );
+                std::process::exit(1);
+            }),
+            (network, None) => network.magic(),
+            (_, Some(_)) => {
+                eprintln!("Error: signet magic only available on signet");
+                std::process::exit(1);
+            }
+        };
 
-        let http_socket_file: Option<PathBuf> = m.value_of("http_socket_file").map(PathBuf::from);
-        let monitoring_addr: SocketAddr = str_to_socketaddr(
-            m.value_of("monitoring_addr")
-                .unwrap_or(&format!("127.0.0.1:{}", default_monitoring_port)),
-            "Prometheus monitoring",
+        let daemon_rpc_addr: SocketAddr = config.daemon_rpc_addr.map_or(
+            (DEFAULT_SERVER_ADDRESS, default_daemon_rpc_port).into(),
+            ResolvAddr::resolve_or_exit,
         );
-
-        let mut daemon_dir = m
-            .value_of("daemon_dir")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                let mut default_dir = home_dir().expect("no homedir");
-                default_dir.push(".bitcoin");
-                default_dir
-            });
-
-        if let Some(network_subdir) = get_network_subdir(network_type) {
-            daemon_dir.push(network_subdir);
+        let daemon_p2p_addr: SocketAddr = config.daemon_p2p_addr.map_or(
+            (DEFAULT_SERVER_ADDRESS, default_daemon_p2p_port).into(),
+            ResolvAddr::resolve_or_exit,
+        );
+        let electrum_rpc_addr: SocketAddr = config.electrum_rpc_addr.map_or(
+            (DEFAULT_SERVER_ADDRESS, default_electrum_port).into(),
+            ResolvAddr::resolve_or_exit,
+        );
+        #[cfg(not(feature = "metrics"))]
+        {
+            if config.monitoring_addr.is_some() {
+                eprintln!("Error: enable \"metrics\" feature to specify monitoring_addr");
+                std::process::exit(1);
+            }
         }
-        let blocks_dir = m
-            .value_of("blocks_dir")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| daemon_dir.join("blocks"));
-        let cookie = m.value_of("cookie").map(|s| s.to_owned());
-
-        let electrum_banner = m.value_of("electrum_banner").map_or_else(
-            || format!("Welcome to electrs-esplora {}", ELECTRS_VERSION),
-            |s| s.into(),
+        let monitoring_addr: SocketAddr = config.monitoring_addr.map_or(
+            (DEFAULT_SERVER_ADDRESS, default_monitoring_port).into(),
+            ResolvAddr::resolve_or_exit,
         );
 
-        #[cfg(feature = "electrum-discovery")]
-        let electrum_public_hosts = m
-            .value_of("electrum_public_hosts")
-            .map(|s| serde_json::from_str(s).expect("invalid --electrum-public-hosts"));
+        match config.network {
+            Network::Bitcoin => (),
+            Network::Testnet => config.daemon_dir.push("testnet3"),
+            Network::Regtest => config.daemon_dir.push("regtest"),
+            Network::Signet => config.daemon_dir.push("signet"),
+            unsupported => unsupported_network(unsupported),
+        }
 
-        let mut log = stderrlog::new();
-        log.verbosity(m.occurrences_of("verbosity") as usize);
-        log.timestamp(if m.is_present("timestamp") {
-            stderrlog::Timestamp::Millisecond
-        } else {
-            stderrlog::Timestamp::Off
+        let daemon_dir = &config.daemon_dir;
+        let daemon_auth = SensitiveAuth(match (config.auth, config.cookie_file) {
+            (None, None) => Auth::CookieFile(daemon_dir.join(".cookie")),
+            (None, Some(cookie_file)) => Auth::CookieFile(cookie_file),
+            (Some(auth), None) => {
+                let parts: Vec<&str> = auth.splitn(2, ':').collect();
+                if parts.len() != 2 {
+                    eprintln!("Error: auth cookie doesn't contain colon");
+                    std::process::exit(1);
+                }
+                Auth::UserPass(parts[0].to_owned(), parts[1].to_owned())
+            }
+            (Some(_), Some(_)) => {
+                eprintln!("Error: ambiguous configuration - auth and cookie_file can't be specified at the same time");
+                std::process::exit(1);
+            }
         });
-        log.init().expect("logging initialization failed");
+
+        if config.verbose > 0 {
+            eprintln!("Error: please use `log_filters` to set logging verbosity",);
+            std::process::exit(1);
+        }
+        let log_filters = config.log_filters;
+
+        let index_lookup_limit = match config.index_lookup_limit {
+            0 => None,
+            _ => Some(config.index_lookup_limit),
+        };
+
+        if config.jsonrpc_timeout_secs <= config.wait_duration_secs {
+            eprintln!(
+                "Error: jsonrpc_timeout_secs ({}) must be higher than wait_duration_secs ({})",
+                config.jsonrpc_timeout_secs, config.wait_duration_secs
+            );
+            std::process::exit(1);
+        }
+
+        if config.version {
+            println!("v{}", ELECTRS_VERSION);
+            std::process::exit(0);
+        }
+
         let config = Config {
-            log,
-            network_type,
-            db_path,
-            daemon_dir,
-            blocks_dir,
+            network: config.network,
+            db_path: config.db_dir,
+            db_log_dir: config.db_log_dir,
+            daemon_dir: config.daemon_dir,
+            daemon_auth,
             daemon_rpc_addr,
-            cookie,
-            utxos_limit: value_t_or_exit!(m, "utxos_limit", usize),
+            daemon_p2p_addr,
             electrum_rpc_addr,
             electrum_txs_limit: value_t_or_exit!(m, "electrum_txs_limit", usize),
             electrum_banner,
@@ -436,111 +360,58 @@ impl Config {
             http_addr,
             http_socket_file,
             monitoring_addr,
-            jsonrpc_import: m.is_present("jsonrpc_import"),
-            light_mode: m.is_present("light_mode"),
-            address_search: m.is_present("address_search"),
-            index_unspendables: m.is_present("index_unspendables"),
-            cors: m.value_of("cors").map(|s| s.to_string()),
-            precache_scripts: m.value_of("precache_scripts").map(|s| s.to_string()),
-
-            #[cfg(feature = "liquid")]
-            parent_network,
-            #[cfg(feature = "liquid")]
-            asset_db_path,
-
-            #[cfg(feature = "electrum-discovery")]
-            electrum_public_hosts,
-            #[cfg(feature = "electrum-discovery")]
-            electrum_announce: m.is_present("electrum_announce"),
-            #[cfg(feature = "electrum-discovery")]
-            tor_proxy: m.value_of("tor_proxy").map(|s| s.parse().unwrap()),
-            sp_begin_height: m.value_of("sp_begin_height").map(|s| s.parse().unwrap()),
-            sp_min_dust: m.value_of("sp_min_dust").map(|s| s.parse().unwrap()),
-            sp_check_spends: m.is_present("sp_check_spends"),
-            skip_history: m.is_present("skip_history"),
-            skip_tweaks: m.is_present("skip_tweaks"),
-            skip_mempool: m.is_present("skip_mempool"),
+            wait_duration: Duration::from_secs(config.wait_duration_secs),
+            jsonrpc_timeout: Duration::from_secs(config.jsonrpc_timeout_secs),
+            index_batch_size: config.index_batch_size,
+            index_lookup_limit,
+            reindex_last_blocks: config.reindex_last_blocks,
+            auto_reindex: config.auto_reindex,
+            ignore_mempool: config.ignore_mempool,
+            sync_once: config.sync_once,
+            skip_block_download_wait: config.skip_block_download_wait,
+            disable_electrum_rpc: config.disable_electrum_rpc,
+            server_banner: config.server_banner,
+            signet_magic: magic,
+            sp_begin_height: config.sp_begin_height,
+            sp_min_dust: config.sp_min_dust,
+            sp_skip_height: config.sp_skip_height,
+            args: args.map(|a| a.into_string().unwrap()).collect(),
         };
-        eprintln!("{:?}", config);
+        eprintln!(
+            "Starting electrs {} on {} {} with {:?}",
+            ELECTRS_VERSION, ARCH, OS, config
+        );
+        let mut builder = env_logger::Builder::from_default_env();
+        builder.default_format().format_timestamp_millis();
+        if let Some(log_filters) = &log_filters {
+            builder.parse_filters(log_filters);
+        }
+        builder.init();
+
         config
     }
-
-    pub fn cookie_getter(&self) -> Arc<dyn CookieGetter> {
-        if let Some(ref value) = self.cookie {
-            Arc::new(StaticCookie {
-                value: value.as_bytes().to_vec(),
-            })
-        } else {
-            Arc::new(CookieFile {
-                daemon_dir: self.daemon_dir.clone(),
-            })
-        }
-    }
 }
 
-#[derive(Debug, Clone)]
-pub enum RpcLogging {
-    Full,
-    NoParams,
-}
+#[cfg(test)]
+mod tests {
+    use super::{Auth, SensitiveAuth};
+    use std::path::Path;
 
-impl RpcLogging {
-    pub fn options() -> Vec<String> {
-        return vec!["full".to_string(), "no-params".to_string()];
-    }
-}
+    #[test]
+    fn test_auth_debug() {
+        let auth = Auth::None;
+        assert_eq!(format!("{:?}", SensitiveAuth(auth)), "None");
 
-impl From<&str> for RpcLogging {
-    fn from(option: &str) -> Self {
-        match option {
-            "full" => RpcLogging::Full,
-            "no-params" => RpcLogging::NoParams,
+        let auth = Auth::CookieFile(Path::new("/foo/bar/.cookie").to_path_buf());
+        assert_eq!(
+            format!("{:?}", SensitiveAuth(auth)),
+            "CookieFile(\"/foo/bar/.cookie\")"
+        );
 
-            _ => panic!("unsupported RPC logging option: {:?}", option),
-        }
-    }
-}
-
-pub fn get_network_subdir(network: Network) -> Option<&'static str> {
-    match network {
-        #[cfg(not(feature = "liquid"))]
-        Network::Bitcoin => None,
-        #[cfg(not(feature = "liquid"))]
-        Network::Testnet => Some("testnet3"),
-        #[cfg(not(feature = "liquid"))]
-        Network::Regtest => Some("regtest"),
-        #[cfg(not(feature = "liquid"))]
-        Network::Signet => Some("signet"),
-
-        #[cfg(feature = "liquid")]
-        Network::Liquid => Some("liquidv1"),
-        #[cfg(feature = "liquid")]
-        Network::LiquidTestnet => Some("liquidtestnet"),
-        #[cfg(feature = "liquid")]
-        Network::LiquidRegtest => Some("liquidregtest"),
-    }
-}
-
-struct StaticCookie {
-    value: Vec<u8>,
-}
-
-impl CookieGetter for StaticCookie {
-    fn get(&self) -> Result<Vec<u8>> {
-        Ok(self.value.clone())
-    }
-}
-
-struct CookieFile {
-    daemon_dir: PathBuf,
-}
-
-impl CookieGetter for CookieFile {
-    fn get(&self) -> Result<Vec<u8>> {
-        let path = self.daemon_dir.join(".cookie");
-        let contents = fs::read(&path).chain_err(|| {
-            ErrorKind::Connection(format!("failed to read cookie from {:?}", path))
-        })?;
-        Ok(contents)
+        let auth = Auth::UserPass("user".to_owned(), "pass".to_owned());
+        assert_eq!(
+            format!("{:?}", SensitiveAuth(auth)),
+            "UserPass(\"user\", \"<sensitive>\")"
+        );
     }
 }
